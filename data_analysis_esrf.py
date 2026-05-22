@@ -535,7 +535,7 @@ class AnalysisApp(ctk.CTk):
             if 'is_whole' in roi and roi['is_whole']:
                 rx = [0, 512]
                 ry = [0, 256]
-                label_name = "Whole Det."
+                label_name = "AdvaPIX"
                 draw_box = False
             else:
                 rx = [self.get_int(roi['x_min']), self.get_int(roi['x_max'])]
@@ -661,8 +661,8 @@ class AnalysisApp(ctk.CTk):
 # PART 4: EXECUTION & VALIDATION
 # ==============================================================================
 if __name__ == "__main__":
-    t3p_file = r"G:\האחסון שלי\ESRF IFM\AdvaPIX_test_meas_7.5.t3p"
-    h5_file = ""  
+    t3p_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_21.5.t3p"
+    h5_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_px5_data_000.h5"
     xml_file = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml" 
 
     t_sec, tot_hits, matrix_idx = load_advacam_t3p(t3p_file)
