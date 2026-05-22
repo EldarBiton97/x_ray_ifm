@@ -22,7 +22,22 @@ def load_advacam_t3p(filepath):
 
     text_log_pattern = re.compile(rb'(?:\d+\t)+\d+\r?\n')
     chunks, last_end = [], 0
+    trigger_time_s = None  # <--- NEW: Storage for the hardware sync pulse
+    
     for match in text_log_pattern.finditer(raw_data):
+        
+        # --- NEW: Extract the trigger ToA from the FIRST ASCII string ---
+        if trigger_time_s is None:
+            ascii_line = match.group()
+            parts = ascii_line.strip().split(b'\t')
+            if len(parts) >= 3:
+                raw_trigger_toa = float(parts[2])
+                # Convert 40MHz clock ticks to seconds (1 tick = 25ns)
+                trigger_time_s = (raw_trigger_toa * 25.0) / 1e9
+                print(f"--> Hardware Sync Pulse Found in ASCII! Baseline T=0 set to: {trigger_time_s:.6f}s")
+        # ----------------------------------------------------------------
+        
+        # Realign the binary stream by slicing off the broken byte offset
         chunk = raw_data[last_end:match.start()]
         rem = len(chunk) % 16
         if rem != 0: chunk = chunk[:-rem]
@@ -80,7 +95,15 @@ def load_advacam_t3p(filepath):
         unwrapped_toa[mask] = c_toa + (cycles * period)
     
     time_s = (unwrapped_toa * 25.0 - ftoa * (25.0 / 16.0)) / 1e9
-    if len(time_s) > 0: time_s = time_s - np.min(time_s)
+    
+    # --- NEW: Master Timeline Synchronization ---
+    if len(time_s) > 0: 
+        if trigger_time_s is not None:
+            # Force the hardware trigger to be exactly T = 0.0
+            time_s = time_s - trigger_time_s
+        else:
+            print("WARNING: No ASCII Hardware Trigger found. Falling back to first-photon dark count.")
+            time_s = time_s - np.min(time_s)
         
     sort_idx = np.argsort(time_s)
     return time_s[sort_idx], tot[sort_idx], matrixIdx[sort_idx]
