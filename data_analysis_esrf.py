@@ -325,7 +325,7 @@ ctk.set_default_color_theme("blue")
 class AnalysisApp(ctk.CTk):
     def __init__(self, raw_t, raw_tot, raw_matrix, a_m, b_m, c_m, t_m, daq_t_s, px5Cum):
         super().__init__()
-        self.title("Master IFM Dashboard | Production Pipeline")
+        self.title("Master IFM Dashboard")
         self.geometry("1600x950")
         
         self.raw_t, self.raw_tot, self.raw_matrix = raw_t, raw_tot, raw_matrix
@@ -359,29 +359,52 @@ class AnalysisApp(ctk.CTk):
         
         ctk.CTkLabel(self.sidebar, text="Port Boundaries", font=("Arial", 16, "bold")).pack(pady=(10, 5))
         self.roi_vars = []
-        for i in range(7):
-            frame = ctk.CTkFrame(self.sidebar)
-            frame.pack(fill="x", pady=2)
+        
+        # --- 2-Column Grid Container for the 6 Ports + 2 Checkboxes ---
+        ports_grid_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        ports_grid_frame.pack(fill="x", pady=2)
+        
+        # Configure columns to distribute space evenly
+        ports_grid_frame.grid_columnconfigure(0, weight=1)
+        ports_grid_frame.grid_columnconfigure(1, weight=1)
+        
+        for i in range(6):
+            row = i // 2
+            col = i % 2
             
-            if i == 6:
-                # The Whole Detector Checkbox (No Entry Boxes)
-                chk_var = ctk.BooleanVar(value=True) # Checked by default!
-                chk = ctk.CTkCheckBox(frame, text="Whole Detector", variable=chk_var, text_color=self.colors[i], font=("Arial", 13, "bold"))
-                chk.pack(side="left", padx=5, pady=5)
-                self.roi_vars.append({'chk': chk_var, 'is_whole': True})
-            else:
-                # The 6 Standard IFM Ports
-                chk_var = ctk.BooleanVar(value=False) # Unchecked by default!
-                chk = ctk.CTkCheckBox(frame, text=f"Port {i+1}", variable=chk_var, text_color=self.colors[i], width=80)
-                chk.grid(row=0, column=0, rowspan=2, padx=5, pady=5)
-                x_min = ctk.CTkEntry(frame, width=50); x_min.insert(0, str(10 + i*40))
-                x_max = ctk.CTkEntry(frame, width=50); x_max.insert(0, str(30 + i*40))
-                x_min.grid(row=0, column=1, padx=2); x_max.grid(row=0, column=2, padx=2)
-                y_min = ctk.CTkEntry(frame, width=50); y_min.insert(0, "100")
-                y_max = ctk.CTkEntry(frame, width=50); y_max.insert(0, "150")
-                y_min.grid(row=1, column=1, padx=2); y_max.grid(row=1, column=2, padx=2)
-                self.roi_vars.append({'chk': chk_var, 'is_whole': False, 'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max})
+            frame = ctk.CTkFrame(ports_grid_frame)
+            frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+            
+            chk_var = ctk.BooleanVar(value=False)
+            chk = ctk.CTkCheckBox(frame, text=f"Port {i+1}", variable=chk_var, text_color=self.colors[i], width=60)
+            chk.grid(row=0, column=0, rowspan=2, padx=5, pady=5)
+            
+            x_min = ctk.CTkEntry(frame, width=40); x_min.insert(0, str(10 + i*40))
+            x_max = ctk.CTkEntry(frame, width=40); x_max.insert(0, str(30 + i*40))
+            x_min.grid(row=0, column=1, padx=2); x_max.grid(row=0, column=2, padx=2)
+            
+            y_min = ctk.CTkEntry(frame, width=40); y_min.insert(0, "100")
+            y_max = ctk.CTkEntry(frame, width=40); y_max.insert(0, "150")
+            y_min.grid(row=1, column=1, padx=2); y_max.grid(row=1, column=2, padx=2)
+            
+            self.roi_vars.append({'chk': chk_var, 'is_whole': False, 'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max})
 
+        # --- Row 3, Column 0: "All Pixels" Checkbox ---
+        all_pixels_frame = ctk.CTkFrame(ports_grid_frame, fg_color="transparent")
+        all_pixels_frame.grid(row=3, column=0, padx=2, pady=5, sticky="nsew")
+        chk_var_all = ctk.BooleanVar(value=True)
+        chk_all = ctk.CTkCheckBox(all_pixels_frame, text="All Pixels", variable=chk_var_all, text_color=self.colors[6], font=("Arial", 13, "bold"))
+        chk_all.pack(side="left", padx=5, pady=5)
+        self.roi_vars.append({'chk': chk_var_all, 'is_whole': True})
+
+        # --- Row 3, Column 1: "Show PX5" Checkbox ---
+        px5_frame = ctk.CTkFrame(ports_grid_frame, fg_color="transparent")
+        px5_frame.grid(row=3, column=1, padx=2, pady=5, sticky="nsew")
+        self.show_px5_var = ctk.BooleanVar(value=True) # Checked by default
+        self.chk_px5 = ctk.CTkCheckBox(px5_frame, text="Show PX5", variable=self.show_px5_var, text_color='green', font=("Arial", 13, "bold"))
+        self.chk_px5.pack(side="left", padx=5, pady=5)
+
+        # --- Global Settings ---
         ctk.CTkLabel(self.sidebar, text="Global Settings", font=("Arial", 16, "bold")).pack(pady=(20, 5))
         e_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         e_frame.pack(fill="x")
@@ -408,7 +431,7 @@ class AnalysisApp(ctk.CTk):
         ctk.CTkLabel(self.sidebar, text="Hardware Engine", font=("Arial", 16, "bold")).pack(pady=(20, 5))
         self.engine_drop = ctk.CTkOptionMenu(
             self.sidebar, 
-            values=['1. CPU Fast (No Charge Sharing)', '2. CPU Cluster (Proper Charge Sharing)']
+            values=['1. No Charge Sharing', '2. Charge Sharing']
         )
         self.engine_drop.pack(fill="x", pady=5)
 
@@ -426,13 +449,13 @@ class AnalysisApp(ctk.CTk):
 
         # --- Physics Parameters Dropdowns ---
         ctk.CTkLabel(self.sidebar, text="Analysis Mode:", anchor="w").pack(fill="x", padx=20, pady=(5, 0))
-        self.mode_drop = ctk.CTkOptionMenu(self.sidebar, values=['Calibration', 'IFM Measurement'])
-        if not self.has_h5: self.mode_drop.set('Calibration')
+        self.mode_drop = ctk.CTkOptionMenu(self.sidebar, values=['Bomb Out', 'Bomb In'])
+        if not self.has_h5: self.mode_drop.set('Bomb Out')
         self.mode_drop.pack(fill="x", padx=20, pady=(0, 10))
         
         ctk.CTkLabel(self.sidebar, text="Dark Port (O-Beam):", anchor="w").pack(fill="x", padx=20, pady=(0, 0))
         self.dark_port_drop = ctk.CTkOptionMenu(self.sidebar, values=[f'Port {i+1}' for i in range(6)])
-        self.dark_port_drop.set('Port 3') # Defaults to your O-Beam
+        self.dark_port_drop.set('Port 3') 
         self.dark_port_drop.pack(fill="x", padx=20, pady=(0, 10))
         
         ctk.CTkLabel(self.sidebar, text="Reference Port:", anchor="w").pack(fill="x", padx=20, pady=(0, 0))
@@ -466,7 +489,7 @@ class AnalysisApp(ctk.CTk):
         self.ax3 = self.fig.add_subplot(self.gs[1, 0]); self.ax4 = self.fig.add_subplot(self.gs[1, 1]) 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_area)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
+        
     def update_plots(self):
         self.btn_update.configure(state="disabled", text="CALCULATING...")
         self.update()
@@ -531,7 +554,6 @@ class AnalysisApp(ctk.CTk):
         for i in range(7):
             roi = self.roi_vars[i]
             
-            # Logic branch for Whole Detector vs Normal Port
             if 'is_whole' in roi and roi['is_whole']:
                 rx = [0, 512]
                 ry = [0, 256]
@@ -568,11 +590,15 @@ class AnalysisApp(ctk.CTk):
                     self.ax4.hist(e_fin_valid, bins=150, range=(e_min, e_max), color=self.colors[i], alpha=0.5, histtype='stepfilled')
                     
         c_px5 = 0
+        mode = self.mode_drop.get()
         if self.has_h5:
             offset_s = self.get_float(self.px5_offset)
             interp_px5 = np.interp(common_bins + offset_s, self.daq_t_s, self.px5Cum)
-            self.ax2.plot(common_bins[:-1], np.diff(interp_px5), color='green', label='PX5', linewidth=1.5)
             c_px5 = np.interp(t_range[1] + offset_s, self.daq_t_s, self.px5Cum) - np.interp(t_range[0] + offset_s, self.daq_t_s, self.px5Cum)
+            
+            # --- ONLY plot PX5 if checkbox is ticked AND mode is Bomb In ---
+            if self.show_px5_var.get() and mode == 'Bomb In':
+                self.ax2.plot(common_bins[:-1], np.diff(interp_px5), color='green', label='PX5', linewidth=1.5)
             
         self.ax2.set_title("Timeline", fontweight='bold')
         self.ax2.set_xlabel("Time (s)")
@@ -592,9 +618,6 @@ class AnalysisApp(ctk.CTk):
         self.fig.tight_layout()
         self.canvas.draw()
 
-        mode = self.mode_drop.get()
-        
-        # Dynamically map dropdown strings ("Port 3") to array indices (2)
         dark_idx = int(self.dark_port_drop.get().split(" ")[1]) - 1
         ref_idx = int(self.ref_port_drop.get().split(" ")[1]) - 1
         
@@ -614,10 +637,10 @@ class AnalysisApp(ctk.CTk):
         res_text += f"\n--- RAW COUNTS ---\n"
         for i in range(6): 
             res_text += f"P{i+1}: {counts_total[i]:.0f} (+sys: {bad_e_roi_counts[i]})\n"
-        res_text += f"Whole Det: {counts_total[6]:.0f} (+sys: {bad_e_roi_counts[6]})\n"
+        res_text += f"All Pixels: {counts_total[6]:.0f} (+sys: {bad_e_roi_counts[6]})\n"
         res_text += f"PX5: {A:.0f}\n\n--- PHYSICS ---\n"
         
-        if mode == 'Calibration':
+        if mode == 'Bomb Out':
             if R > 0: 
                 res_text += f"Dark Error (P{dark_idx+1}/P{ref_idx+1}): {(D/R)*100:.4f}%\n"
             else: 
@@ -629,7 +652,6 @@ class AnalysisApp(ctk.CTk):
                 p_det_clip = max(0.0, p_det_raw)
                 p_abs = A / R if self.has_h5 else 0.0
                 
-                # Poisson Error Propagation
                 var_p_det = (D / (R**2)) + ((D**2) / (R**3))
                 sig_p_det = np.sqrt(var_p_det) if var_p_det > 0 else 0.0
                 
@@ -639,7 +661,6 @@ class AnalysisApp(ctk.CTk):
                 eta_raw = (p_det_raw / (p_det_raw + p_abs)) * 100.0 if (p_det_raw + p_abs) > 0 else 0.0
                 eta_clip = (p_det_clip / (p_det_clip + p_abs)) * 100.0 if (p_det_clip + p_abs) > 0 else 0.0
                 
-                # Error propagation for ETA = Pdet / (Pdet + Pabs)
                 if (p_det_raw + p_abs) > 0:
                     d_eta_d_pdet = p_abs / ((p_det_raw + p_abs)**2)
                     d_eta_d_pabs = -p_det_raw / ((p_det_raw + p_abs)**2)
@@ -650,7 +671,7 @@ class AnalysisApp(ctk.CTk):
 
                 res_text += f"P(det): {p_det_clip:.5f} ± {sig_p_det:.5f} (raw: {p_det_raw:.5f})\n"
                 res_text += f"P(abs): {p_abs:.5f} ± {sig_p_abs:.5f}\n"
-                res_text += f"ETA:    {eta_clip:.2f}% ± {sig_eta:.2f}%\n"
+                res_text += f"IFM Efficiency:    {eta_clip:.2f}% ± {sig_eta:.2f}%\n"
             else: 
                 res_text += f"Error: Reference P{ref_idx+1} has 0 counts\n"
 
