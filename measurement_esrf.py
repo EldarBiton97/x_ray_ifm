@@ -68,10 +68,10 @@ class DAQControlApp(ctk.CTk):
         self.ui_minutes.pack(side="left", padx=5)
         self.ui_minutes.bind("<KeyRelease>", self.update_hardware_calc)
 
-        ctk.CTkLabel(time_frame, text="Split Every (hr):").pack(side="left", padx=(30, 5))
-        self.ui_split_hours = ctk.CTkEntry(time_frame, width=60)
-        self.ui_split_hours.insert(0, "1")
-        self.ui_split_hours.pack(side="left", padx=5)
+        ctk.CTkLabel(time_frame, text="Split Every (min):").pack(side="left", padx=(30, 5))
+        self.ui_split_minutes = ctk.CTkEntry(time_frame, width=60)
+        self.ui_split_minutes.insert(0, "60") # Defaulting to 60 minutes
+        self.ui_split_minutes.pack(side="left", padx=5)
 
         # DAQ Parameters
         daq_frame = ctk.CTkFrame(setup_frame, fg_color="transparent")
@@ -171,7 +171,7 @@ class DAQControlApp(ctk.CTk):
         self.ui_status.configure(text="Live Status: Initializing Setup...", text_color="orange")
         
         total_duration_s = (self.get_int_safe(self.ui_days) * 86400) + (self.get_int_safe(self.ui_hours) * 3600) + (self.get_int_safe(self.ui_minutes) * 60)
-        split_s = self.get_int_safe(self.ui_split_hours, 1) * 3600
+        split_s = self.get_int_safe(self.ui_split_minutes, 60) * 60
         chunk_s = float(int(self.ui_chunk.get()))
         binRateHz = float(self.bin_options[self.ui_bin_size.get()])
         
