@@ -6,7 +6,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import customtkinter as ctk
 import h5py
 import os
-import re
 import xml.etree.ElementTree as ET
 import base64
 from numba import njit
@@ -15,7 +14,6 @@ from numba import njit
 # PART 1: THE T3P PARSER & STRICT GEOMETRY VALIDATION
 # DAQ/PX5-LOCKED VERSION (SEQUENTIAL STATE MACHINE)
 # ==============================================================================
-import numpy as np
 
 def _unwrap_28bit_ticks(raw_ticks, period=268435456.0):
     raw_ticks = np.asarray(raw_ticks, dtype=np.float64)
