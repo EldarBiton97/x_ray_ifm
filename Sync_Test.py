@@ -14,227 +14,66 @@ from scipy.signal import correlate, correlation_lags  # <--- Added for Sync Test
 
 # ==============================================================================
 # PART 1: THE T3P PARSER & STRICT GEOMETRY VALIDATION
-# DAQ/PX5-LOCKED VERSION
+# DAQ/PX5-LOCKED VERSION (SEQUENTIAL STATE MACHINE)
 # ==============================================================================
+import numpy as np
 
 def _unwrap_28bit_ticks(raw_ticks, period=268435456.0):
-    """
-    Unwrap a 28-bit Timepix/AdvaPIX counter sequence.
-
-    Parameters
-    ----------
-    raw_ticks : array-like
-        Raw 28-bit tick values in acquisition/file order.
-    period : float
-        2**28 counter period.
-
-    Returns
-    -------
-    np.ndarray
-        Unwrapped tick values as float64.
-    """
     raw_ticks = np.asarray(raw_ticks, dtype=np.float64)
-    if raw_ticks.size == 0:
-        return raw_ticks.copy()
-
+    if raw_ticks.size == 0: return raw_ticks.copy()
     half_period = period / 2.0
     deltas = np.diff(raw_ticks)
-
     roll_forward = (deltas < -half_period).astype(np.int64)
     roll_backward = (deltas > half_period).astype(np.int64)
-
     cycles = np.zeros(raw_ticks.size, dtype=np.int64)
     cycles[1:] = np.cumsum(roll_forward - roll_backward)
-
     return raw_ticks + cycles * period
 
-
-def _deduplicate_heartbeat_ticks(
-    raw_trigger_ticks,
-    min_separation_ticks=20_000_000.0,
-    period=268435456.0
-):
-    """
-    The AdvaPIX writes one ASCII heartbeat packet per chip.
-    For a 2-chip camera, each DAQ heartbeat therefore appears twice.
-
-    This function:
-      1. unwraps the raw heartbeat ToA ticks,
-      2. groups chip-duplicate heartbeat records,
-      3. returns one heartbeat tick per DAQ second.
-
-    Duplicate heartbeats are grouped when they are separated by less than
-    min_separation_ticks, default 20M ticks = 0.5 s nominal.
-    """
+def _deduplicate_heartbeat_ticks(raw_trigger_ticks, min_separation_ticks=20_000_000.0, period=268435456.0):
     raw_trigger_ticks = np.asarray(raw_trigger_ticks, dtype=np.float64)
-    if raw_trigger_ticks.size == 0:
-        return np.array([], dtype=np.float64)
-
+    if raw_trigger_ticks.size == 0: return np.array([], dtype=np.float64)
     unwrapped_all = _unwrap_28bit_ticks(raw_trigger_ticks, period=period)
-
     groups = []
     current_group = [unwrapped_all[0]]
-
     for val in unwrapped_all[1:]:
-        # Same DAQ heartbeat recorded by the second chip, or duplicate telemetry.
         if (val - current_group[-1]) < min_separation_ticks:
             current_group.append(val)
         else:
             groups.append(current_group)
             current_group = [val]
-
     groups.append(current_group)
-
-    # Median is robust if the two chip heartbeat timestamps differ by a few ticks.
-    unique_heartbeats = np.array(
-        [np.median(g) for g in groups],
-        dtype=np.float64
-    )
-
+    unique_heartbeats = np.array([np.median(g) for g in groups], dtype=np.float64)
     return unique_heartbeats
 
-
-def _build_heartbeat_daq_times(
-    heartbeat_ticks,
-    expected_ticks_per_second=40_000_000.0,
-    max_fractional_interval_error=0.25
-):
-    """
-    Build the DAQ-time value assigned to each heartbeat.
-
-    Normally heartbeat i corresponds to DAQ time i seconds.
-    But if one heartbeat is missing, the interval can be ~80M ticks,
-    which should correspond to 2 DAQ seconds, not 1.
-
-    Therefore the DAQ time step between consecutive heartbeat anchors is:
-        round(delta_ticks / expected_ticks_per_second)
-
-    Returns
-    -------
-    heartbeat_daq_times : np.ndarray
-        DAQ seconds assigned to each heartbeat.
-    intervals : np.ndarray
-        Tick intervals between heartbeats.
-    steps : np.ndarray
-        Integer DAQ-second steps between heartbeats.
-    residual_ticks : np.ndarray
-        intervals - steps * expected_ticks_per_second
-    """
+def _build_heartbeat_daq_times(heartbeat_ticks, expected_ticks_per_second=40_000_000.0, max_fractional_interval_error=0.25):
     heartbeat_ticks = np.asarray(heartbeat_ticks, dtype=np.float64)
-
     if heartbeat_ticks.size < 2:
-        raise ValueError(
-            "Need at least two unique DAQ heartbeat records to synchronize "
-            "AdvaPIX photon times to the PX5/DAQ clock."
-        )
-
+        raise ValueError("Need at least two unique DAQ heartbeat records to synchronize.")
     intervals = np.diff(heartbeat_ticks)
-
     if np.any(intervals <= 0):
-        raise ValueError(
-            "Heartbeat ticks are not strictly increasing after unwrapping/deduplication."
-        )
-
+        raise ValueError("Heartbeat ticks are not strictly increasing.")
     steps = np.rint(intervals / expected_ticks_per_second).astype(np.int64)
-
     if np.any(steps < 1):
-        raise ValueError(
-            "Invalid heartbeat interval: at least one interval is shorter than "
-            "half of the expected 1 Hz heartbeat spacing."
-        )
-
+        raise ValueError("Invalid heartbeat interval.")
     residual_ticks = intervals - steps.astype(np.float64) * expected_ticks_per_second
     frac_error = np.abs(residual_ticks) / expected_ticks_per_second
-
     bad = np.nonzero(frac_error > max_fractional_interval_error)[0]
     if bad.size > 0:
-        first_bad = bad[0]
-        raise ValueError(
-            "Heartbeat interval is not consistent with the expected 1 Hz DAQ pulse. "
-            f"Bad interval index {first_bad}: "
-            f"interval={intervals[first_bad]:.3f} ticks, "
-            f"nearest integer seconds={steps[first_bad]}, "
-            f"residual={residual_ticks[first_bad]:.3f} ticks."
-        )
-
+        raise ValueError(f"Heartbeat interval not consistent. Bad index {bad[0]}.")
     heartbeat_daq_times = np.zeros(heartbeat_ticks.size, dtype=np.float64)
     heartbeat_daq_times[1:] = np.cumsum(steps).astype(np.float64)
-
     return heartbeat_daq_times, intervals, steps, residual_ticks
-
 
 def load_advacam_t3p(
     filepath,
     *,
     strict_two_chip=True,
-    max_unmapped_fraction=0.02,
+    max_unmapped_fraction=1e-6,
     expected_ticks_per_second=40_000_000.0,
     heartbeat_duplicate_separation_ticks=20_000_000.0,
     drop_unanchored_photons=True,
     return_diagnostics=False
 ):
-    """
-    Load an AdvaPIX .t3p file containing:
-      1. binary Timepix3 photon-hit packets,
-      2. ASCII DAQ heartbeat packets, one per chip per second.
-
-    The returned photon times are mapped onto the DAQ/PX5 clock.
-
-    Synchronization model
-    ---------------------
-    The DAQ sends:
-      - 1 MHz pulses to the PX5, setting its 1 us bins.
-      - 1 Hz heartbeat pulses to the AdvaPIX.
-
-    The AdvaPIX timestamps those 1 Hz heartbeat pulses with its own clock.
-    Since the AdvaPIX clock is not exactly the DAQ/PX5 clock, we do not assume
-    exactly 25 ns per tick for the final synchronized time.
-
-    Instead, heartbeat anchors define the mapping:
-
-        heartbeat tick H[k]     -> DAQ time T[k]
-        heartbeat tick H[k + 1] -> DAQ time T[k + 1]
-
-    For a photon between those heartbeats:
-
-        photon_tick_fine = ToA - FToA / 16
-
-        time_s = T[k] + (
-            (photon_tick_fine - H[k]) / (H[k + 1] - H[k])
-        ) * (T[k + 1] - T[k])
-
-    This makes the AdvaPIX photon times live on the DAQ/PX5 clock.
-
-    Parameters
-    ----------
-    filepath : str
-        Path to .t3p file.
-    strict_two_chip : bool
-        If True, keep only matrixIdx < 131072, matching a 512 x 256 two-chip detector.
-    max_unmapped_fraction : float
-        Abort if more than this fraction of binary records are outside the two-chip geometry.
-    expected_ticks_per_second : float
-        Nominal AdvaPIX ticks per DAQ second. For 25 ns ticks, this is 40,000,000.
-    heartbeat_duplicate_separation_ticks : float
-        Heartbeat records closer than this are treated as the same DAQ pulse
-        recorded by multiple chips.
-    drop_unanchored_photons : bool
-        If True, drop photons before the first heartbeat or after the last heartbeat,
-        because they cannot be interpolated between two DAQ anchors.
-    return_diagnostics : bool
-        If True, return a fourth object with parser diagnostics.
-
-    Returns
-    -------
-    time_s : np.ndarray
-        Photon times in DAQ/PX5 seconds.
-    tot : np.ndarray
-        Photon ToT.
-    matrixIdx : np.ndarray
-        Photon matrix indices.
-    diagnostics : dict, optional
-        Returned only if return_diagnostics=True.
-    """
     print(f"Loading Timepix3 data from {filepath}...")
 
     with open(filepath, "rb") as f:
@@ -243,57 +82,59 @@ def load_advacam_t3p(
     if len(raw_data) == 0:
         raise ValueError("File is empty.")
 
-    # Strict six-field ASCII heartbeat line.
-    # Example:
-    #   0 \t 0 \t 62 \t 0 \t 49152 \t 10
-    #
-    # The third field, parts[2], is the heartbeat ToA tick.
-    heartbeat_pattern = re.compile(
-        rb'\d+\s*\t\s*\d+\s*\t\s*\d+\s*\t\s*\d+\s*\t\s*\d+\s*\t\s*\d+\s*\r?\n'
-    )
-
-    chunks = []
-    last_end = 0
+    # ------------------------------------------------------------------
+    # 1. SEQUENTIAL STATE MACHINE (HIGH PERFORMANCE)
+    # ------------------------------------------------------------------
+    records = []
     raw_trigger_ticks = []
+    
+    i = 0
+    valid_start = 0
+    data_len = len(raw_data)
+    
+    # Scan in 16-byte steps, slicing large blocks of memory for speed
+    while i <= data_len - 16:
+        matrixIdx = int.from_bytes(raw_data[i:i+4], 'little')
+        
+        if matrixIdx >= 131072:
+            # THIS IS NOT A PIXEL. Telemetry starts here.
+            # Append the block of valid pixels scanned so far
+            if i > valid_start:
+                records.append(raw_data[valid_start:i])
+            
+            # Read forward to the line ending (0x0A)
+            end_idx = raw_data.find(b'\n', i)
+            if end_idx == -1:
+                break # Reached EOF safely
+            
+            # Extract the heartbeat ToA
+            ascii_line = raw_data[i:end_idx+1]
+            parts = ascii_line.strip().split(b'\t')
+            if len(parts) == 6:
+                try:
+                    heartbeat_toa = int(parts[2]) & 0x0FFFFFFF
+                    raw_trigger_ticks.append(float(heartbeat_toa))
+                except ValueError:
+                    pass
+            
+            # Re-align the read pointer perfectly to the next byte after \n
+            i = end_idx + 1
+            valid_start = i 
+        else:
+            # Valid pixel, continue scanning
+            i += 16
+            
+    # Append the final block of valid pixels
+    if valid_start < data_len:
+        rem = (data_len - valid_start) % 16
+        end_val = data_len - rem
+        if end_val > valid_start:
+            records.append(raw_data[valid_start:end_val])
+            
+    binary_data = b"".join(records)
 
     # ------------------------------------------------------------------
-    # 1. Remove ASCII heartbeat packets and collect their ToA ticks.
-    # ------------------------------------------------------------------
-    for match in heartbeat_pattern.finditer(raw_data):
-        ascii_line = match.group()
-        parts = re.split(rb'\s*\t\s*', ascii_line.strip())
-
-        if len(parts) == 6:
-            try:
-                vals = [int(p) for p in parts]
-                heartbeat_toa = vals[2] & 0x0FFFFFFF
-                raw_trigger_ticks.append(float(heartbeat_toa))
-            except ValueError:
-                # Should not happen with the regex, but keep parser safe.
-                pass
-
-        # Keep only the binary data before this ASCII line.
-        chunk = raw_data[last_end:match.start()]
-
-        # Binary photon records are 16 bytes. If the chunk is not aligned,
-        # trim only the trailing incomplete bytes adjacent to the ASCII packet.
-        rem = len(chunk) % 16
-        if rem != 0:
-            chunk = chunk[:-rem]
-
-        chunks.append(chunk)
-        last_end = match.end()
-
-    final_chunk = raw_data[last_end:]
-    rem = len(final_chunk) % 16
-    if rem != 0:
-        final_chunk = final_chunk[:-rem]
-    chunks.append(final_chunk)
-
-    binary_data = b"".join(chunks)
-
-    # ------------------------------------------------------------------
-    # 2. Parse binary photon records.
+    # 2. Parse binary photon records
     # ------------------------------------------------------------------
     dt = np.dtype([
         ("matrixIdx", "<u4"),
@@ -306,10 +147,10 @@ def load_advacam_t3p(
     data = np.frombuffer(binary_data, dtype=dt)
 
     if len(data) == 0:
-        raise ValueError("No binary photon records were found after removing ASCII heartbeat packets.")
+        raise ValueError("No binary photon records were found.")
 
     # ------------------------------------------------------------------
-    # 3. Strict two-chip geometry validation.
+    # 3. Strict two-chip geometry validation
     # ------------------------------------------------------------------
     n_raw = len(data)
     chip_ids_all = data["matrixIdx"] // 65536
@@ -333,14 +174,13 @@ def load_advacam_t3p(
 
     if strict_two_chip and drop_frac > max_unmapped_fraction:
         raise ValueError(
-            f"More than {100.0 * max_unmapped_fraction:.5f}% of photon records are outside "
-            "the strict two-chip geometry. Aborting instead of silently deleting data."
+            f"Detected {n_drop:,} impossible matrixIdx records ({100.0 * drop_frac:.6f}%). "
+            "This suggests byte corruption or a geometry mismatch."
         )
 
     clean_data = data[valid_mask]
-
     if len(clean_data) == 0:
-        raise ValueError("No valid photon records remain after geometry filtering.")
+        raise ValueError("No valid photon records remain after filtering.")
 
     matrixIdx = clean_data["matrixIdx"].astype(np.uint32)
     ftoa = clean_data["ftoa"].astype(np.float64)
@@ -348,7 +188,7 @@ def load_advacam_t3p(
     raw_toa = (clean_data["toa"] & 0x0FFFFFFF).astype(np.float64)
 
     # ------------------------------------------------------------------
-    # 4. Unwrap photon ToA per chip in original file order.
+    # 4. Unwrap photon ToA per chip
     # ------------------------------------------------------------------
     unwrapped_toa = np.zeros_like(raw_toa, dtype=np.float64)
     chip_ids = matrixIdx // 65536
@@ -357,38 +197,21 @@ def load_advacam_t3p(
     for cid in np.unique(chip_ids):
         mask = (chip_ids == cid)
         c_toa = raw_toa[mask]
-
-        if c_toa.size == 0:
-            continue
-
+        if c_toa.size == 0: continue
         deltas = np.diff(c_toa)
         non_monotonic = int(np.count_nonzero(deltas < 0))
         rollover_like = int(np.count_nonzero(deltas < -134217728.0))
-
-        print(
-            f"Chip {int(cid)}: {non_monotonic:,} negative ToA steps, "
-            f"{rollover_like:,} rollover-like steps."
-        )
-
+        print(f"Chip {int(cid)}: {non_monotonic:,} negative ToA steps, {rollover_like:,} rollover-like steps.")
         unwrapped_toa[mask] = _unwrap_28bit_ticks(c_toa)
-
     print("------------------------------------\n")
 
-    # Fine photon tick in AdvaPIX tick units.
-    # The old timing expression:
-    #   time_ns = ToA * 25 - FToA * (25 / 16)
-    # is equivalent to:
-    #   fine_tick = ToA - FToA / 16
     photon_tick_fine = unwrapped_toa - (ftoa / 16.0)
 
     # ------------------------------------------------------------------
-    # 5. Build DAQ heartbeat anchors.
+    # 5. Build DAQ heartbeat anchors
     # ------------------------------------------------------------------
     if len(raw_trigger_ticks) < 2:
-        raise ValueError(
-            "Fewer than two ASCII DAQ heartbeat packets were found. "
-            "Cannot synchronize AdvaPIX times to the DAQ/PX5 clock."
-        )
+        raise ValueError("Fewer than two ASCII DAQ heartbeat packets found.")
 
     heartbeat_ticks = _deduplicate_heartbeat_ticks(
         raw_trigger_ticks,
@@ -396,10 +219,7 @@ def load_advacam_t3p(
     )
 
     if heartbeat_ticks.size < 2:
-        raise ValueError(
-            "Fewer than two unique DAQ heartbeats remain after duplicate-chip filtering. "
-            "Cannot perform piecewise DAQ-clock synchronization."
-        )
+        raise ValueError("Fewer than two unique DAQ heartbeats remain.")
 
     heartbeat_daq_times, hb_intervals, hb_steps, hb_residual_ticks = _build_heartbeat_daq_times(
         heartbeat_ticks,
@@ -412,42 +232,22 @@ def load_advacam_t3p(
     print(f"First heartbeat tick:        {heartbeat_ticks[0]:.3f}")
     print(f"Last heartbeat tick:         {heartbeat_ticks[-1]:.3f}")
     print(f"DAQ time span:               {heartbeat_daq_times[0]:.6f} s to {heartbeat_daq_times[-1]:.6f} s")
-
-    if hb_intervals.size > 0:
-        print(f"Interval ticks median:       {np.median(hb_intervals):.3f}")
-        print(f"Interval ticks min/max:      {np.min(hb_intervals):.3f} / {np.max(hb_intervals):.3f}")
-        print(f"DAQ-second steps present:    {sorted(set(hb_steps.tolist()))}")
-        print(
-            "Max residual vs nearest DAQ-second interval: "
-            f"{np.max(np.abs(hb_residual_ticks)):.3f} ticks "
-            f"= {np.max(np.abs(hb_residual_ticks)) * 25.0:.3f} ns nominal"
-        )
     print("--------------------------------\n")
 
     # ------------------------------------------------------------------
-    # 6. Piecewise-linear DAQ-clock synchronization.
+    # 6. Piecewise-linear DAQ-clock synchronization
     # ------------------------------------------------------------------
     hb_indices = np.searchsorted(heartbeat_ticks, photon_tick_fine, side="right") - 1
-
-    # Need both H[k] and H[k+1] for interpolation.
     anchored = (hb_indices >= 0) & (hb_indices < heartbeat_ticks.size - 1)
-
     n_unanchored = int(np.count_nonzero(~anchored))
 
     if n_unanchored > 0:
         frac_unanchored = n_unanchored / max(len(photon_tick_fine), 1)
-        msg = (
-            f"{n_unanchored:,} photon records "
-            f"({100.0 * frac_unanchored:.6f}%) are outside the heartbeat-covered time range."
-        )
-
+        msg = f"{n_unanchored:,} photon records ({100.0 * frac_unanchored:.6f}%) are outside the heartbeat-covered time range."
         if drop_unanchored_photons:
             print("WARNING:", msg, "They will be dropped.")
         else:
-            raise ValueError(
-                msg + " Set drop_unanchored_photons=True to drop them, or provide a file "
-                "with heartbeat anchors bracketing the full acquisition."
-            )
+            raise ValueError(msg)
 
     matrixIdx = matrixIdx[anchored]
     tot = tot[anchored]
@@ -463,24 +263,19 @@ def load_advacam_t3p(
     interval_seconds = T1 - T0
 
     if np.any(interval_ticks <= 0):
-        raise ValueError("Non-positive heartbeat interval encountered during interpolation.")
+        raise ValueError("Non-positive heartbeat interval encountered.")
 
     frac = (photon_tick_fine - H0) / interval_ticks
-
-    # Numerical safety. Values should naturally be in [0, 1).
     bad_frac = (frac < -1e-9) | (frac > 1.0 + 1e-9)
     if np.any(bad_frac):
-        raise ValueError(
-            "Internal synchronization error: some photon times are outside their heartbeat interval."
-        )
+        raise ValueError("Internal synchronization error.")
 
     time_s = T0 + frac * interval_seconds
 
     # ------------------------------------------------------------------
-    # 7. Sort output by DAQ/PX5 time.
+    # 7. Sort output by DAQ/PX5 time
     # ------------------------------------------------------------------
     sort_idx = np.argsort(time_s)
-
     time_s = time_s[sort_idx]
     tot = tot[sort_idx]
     matrixIdx = matrixIdx[sort_idx]
@@ -495,17 +290,6 @@ def load_advacam_t3p(
 
     if return_diagnostics:
         diagnostics = {
-            "raw_binary_records": n_raw,
-            "kept_binary_records": n_keep,
-            "dropped_unmapped_records": n_drop,
-            "dropped_unmapped_fraction": drop_frac,
-            "raw_ascii_heartbeat_packets": len(raw_trigger_ticks),
-            "unique_heartbeat_count": int(heartbeat_ticks.size),
-            "heartbeat_ticks": heartbeat_ticks,
-            "heartbeat_daq_times": heartbeat_daq_times,
-            "heartbeat_intervals_ticks": hb_intervals,
-            "heartbeat_step_seconds": hb_steps,
-            "heartbeat_residual_ticks": hb_residual_ticks,
             "unanchored_photon_records": n_unanchored,
         }
         return time_s, tot, matrixIdx, diagnostics
