@@ -213,10 +213,25 @@ def load_advacam_t3p(
     photon_tick_fine = unwrapped_toa - (ftoa / 16.0)
 
     # ------------------------------------------------------------------
-    # 5. Build DAQ heartbeat anchors
+    # 5. Build DAQ heartbeat anchors OR Bypass if none exist
     # ------------------------------------------------------------------
     if len(raw_trigger_ticks) < 2:
-        raise ValueError("Fewer than two ASCII DAQ heartbeat packets found.")
+        print("\n--- NO DAQ SYNC ---")
+        print("No heartbeat triggers found. Returning native Timepix3 unsynchronized time.")
+        
+        # Convert native 40MHz ticks to seconds
+        time_s = photon_tick_fine / expected_ticks_per_second
+        
+        # Sort and return early
+        sort_idx = np.argsort(time_s)
+        time_s = time_s[sort_idx]
+        tot = tot[sort_idx]
+        matrixIdx = matrixIdx[sort_idx]
+        
+        if return_diagnostics:
+            return time_s, tot, matrixIdx, {"unanchored_photon_records": len(time_s)}
+        return time_s, tot, matrixIdx
+
 
     heartbeat_ticks = _deduplicate_heartbeat_ticks(
         raw_trigger_ticks,
@@ -970,8 +985,8 @@ class AnalysisApp(ctk.CTk):
 # PART 4: EXECUTION & VALIDATION
 # ==============================================================================
 if __name__ == "__main__":
-    t3p_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_r2.t3p"
-    h5_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_px5_data_002.h5"
+    t3p_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_r1.t3p"
+    h5_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_px5_data_001.h5"
     xml_file = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml" 
 
     t_sec, tot_hits, matrix_idx = load_advacam_t3p(t3p_file)
