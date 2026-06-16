@@ -10,6 +10,9 @@ import xml.etree.ElementTree as ET
 import base64
 from numba import njit
 from scipy.signal import correlate, correlation_lags  # <--- Added for Sync Test
+import struct
+import re
+import mmap
 
 # ==============================================================================
 # PART 1: THE T3P PARSER & STRICT GEOMETRY VALIDATION
@@ -74,65 +77,70 @@ def load_advacam_t3p(
 ):
     print(f"Loading Timepix3 data from {filepath}...")
 
-    with open(filepath, "rb") as f:
-        raw_data = f.read()
-
-    if len(raw_data) == 0:
-        raise ValueError("File is empty.")
-
     # ------------------------------------------------------------------
-    # 1. SEQUENTIAL STATE MACHINE (HIGH PERFORMANCE)
+    # 1. FAST MEMORY-MAPPED REGEX PARSING
     # ------------------------------------------------------------------
-    records = []
+    # We match ANY 6-column text injection (including shutter states like 11/14/15)
+    # so we can cleanly strip them from the binary stream.
+    hw_trigger_pattern = re.compile(rb'\d+\t\d+\t\d+\t\d+\t\d+\t\d+\r?\n')
+    
     raw_trigger_ticks = []
+    binary_chunks = []
     
-    i = 0
-    valid_start = 0
-    data_len = len(raw_data)
-    
-    # Scan in 16-byte steps, slicing large blocks of memory for speed
-    while i <= data_len - 16:
-        matrixIdx = int.from_bytes(raw_data[i:i+4], 'little')
+    with open(filepath, "rb") as f:
+        # Check if empty
+        f.seek(0, 2)
+        if f.tell() == 0:
+            raise ValueError("File is empty.")
+        f.seek(0)
         
-        if matrixIdx >= 131072:
-            # THIS IS NOT A PIXEL. Telemetry starts here.
-            # Append the block of valid pixels scanned so far
-            if i > valid_start:
-                records.append(raw_data[valid_start:i])
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        last_idx = 0
+        
+        # Isolate text injections and save the pure binary data
+        for match in hw_trigger_pattern.finditer(mm):
+            start, end = match.span()
             
-            # Read forward to the line ending (0x0A)
-            end_idx = raw_data.find(b'\n', i)
-            if end_idx == -1:
-                break # Reached EOF safely
+            # Slice out the pure binary chunk that occurred before this text
+            chunk = mm[last_idx:start]
             
-            # Extract the heartbeat ToA
-            ascii_line = raw_data[i:end_idx+1]
-            parts = ascii_line.strip().split(b'\t')
+            # Ensure the chunk perfectly aligns to 16 bytes. If a buffer glitch 
+            # interrupted a packet right before the text, this drops the broken bytes.
+            valid_len = (len(chunk) // 16) * 16
+            if valid_len > 0:
+                binary_chunks.append(chunk[:valid_len])
+                
+            # Parse the text trigger
+            text_str = match.group(0).decode('ascii', errors='ignore').strip()
+            parts = text_str.split('\t')
+            
             if len(parts) == 6:
-                try:
-                    heartbeat_toa = int(parts[2]) & 0x0FFFFFFF
-                    raw_trigger_ticks.append(float(heartbeat_toa))
-                except ValueError:
-                    pass
+                trigger_id = int(parts[5])
+                
+                # ONLY use overflow=10 (Heartbeat Sync) for time synchronization
+                if trigger_id == 10:
+                    try:
+                        # Mask to 28 bits as per your original synchronization math
+                        heartbeat_toa = int(parts[2]) & 0x0FFFFFFF
+                        raw_trigger_ticks.append(float(heartbeat_toa))
+                    except ValueError:
+                        pass
+                        
+            last_idx = end
             
-            # Re-align the read pointer perfectly to the next byte after \n
-            i = end_idx + 1
-            valid_start = i 
-        else:
-            # Valid pixel, continue scanning
-            i += 16
+        # Append the final binary chunk after the last text injection
+        chunk = mm[last_idx:]
+        valid_len = (len(chunk) // 16) * 16
+        if valid_len > 0:
+            binary_chunks.append(chunk[:valid_len])
             
-    # Append the final block of valid pixels
-    if valid_start < data_len:
-        rem = (data_len - valid_start) % 16
-        end_val = data_len - rem
-        if end_val > valid_start:
-            records.append(raw_data[valid_start:end_val])
-            
-    binary_data = b"".join(records)
+        mm.close()
+
+    # Glue all the perfectly aligned 16-byte chunks together
+    binary_data = b"".join(binary_chunks)
 
     # ------------------------------------------------------------------
-    # 2. Parse binary photon records
+    # 2. Parse binary photon records (High-Speed NumPy Engine)
     # ------------------------------------------------------------------
     dt = np.dtype([
         ("matrixIdx", "<u4"),
@@ -963,8 +971,8 @@ class AnalysisApp(ctk.CTk):
 # PART 4: EXECUTION & VALIDATION
 # ==============================================================================
 if __name__ == "__main__":
-    t3p_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_21.5.t3p"
-    h5_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_px5_data_000.h5"
+    t3p_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_r2.t3p"
+    h5_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_px5_data_002.h5"
     xml_file = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml" 
 
     t_sec, tot_hits, matrix_idx = load_advacam_t3p(t3p_file)
