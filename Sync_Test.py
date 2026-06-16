@@ -10,7 +10,6 @@ import xml.etree.ElementTree as ET
 import base64
 from numba import njit
 from scipy.signal import correlate, correlation_lags  # <--- Added for Sync Test
-import struct
 import re
 import mmap
 
