@@ -699,7 +699,100 @@ class AnalysisApp(ctk.CTk):
         self.ax3 = self.fig.add_subplot(self.gs[1, 0]); self.ax4 = self.fig.add_subplot(self.gs[1, 1]) 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_area)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+    
+    # ==============================================================================
+    # INTEGRATED CROSS-CORRELATION ENGINE (PATCHED)
+    # ==============================================================================
+    def run_sync_test(self):
+        if not self.has_h5:
+            self.results_txt.configure(state="normal")
+            self.results_txt.insert("end", "\n[ERROR] No PX5 data loaded.\n")
+            self.results_txt.configure(state="disabled")
+            return
 
+        if self.t_s is None: self.update_plots()
+        if len(self.daq_t_s) < 2: return
+        
+        # 1. Obey the UI Time Zoom and UI Bin Size!
+        t_start = self.get_float(self.t_min)
+        t_end = self.get_float(self.t_max)
+        bin_s = self.get_float(self.bin_ms) / 1000.0
+
+        if bin_s <= 0 or t_end <= t_start: return
+
+        # 2. Filter AdvaPIX Energy
+        e_min, e_max = self.get_float(self.e_min), self.get_float(self.e_max)
+        selected_engine = self.engine_drop.get()
+        
+        has_valid_e = ~np.isnan(self.energy)
+        good_energy_cluster = (self.bad_e_counts == 0)
+        in_energy_range = has_valid_e & (self.energy >= e_min) & (self.energy <= e_max)
+        
+        if "2." in selected_engine: counting_mask = in_energy_range & good_energy_cluster
+        else: counting_mask = in_energy_range
+
+        # Apply BOTH Energy AND Time constraints
+        time_mask = (self.t_s >= t_start) & (self.t_s <= t_end)
+        filtered_t_s = self.t_s[counting_mask & time_mask]
+
+        if len(filtered_t_s) == 0:
+            self.results_txt.configure(state="normal")
+            self.results_txt.insert("end", f"\n[ERROR] No AdvaPIX hits in {e_min}-{e_max} keV between {t_start}-{t_end}s.\n")
+            self.results_txt.configure(state="disabled")
+            return
+
+        self.btn_sync.configure(text="CALCULATING...", state="disabled")
+        self.update()
+
+        # 3. Bin AdvaPIX data using the UI bin size
+        common_bin_edges = np.arange(t_start, t_end + bin_s, bin_s)
+        adva_bins, _ = np.histogram(filtered_t_s, bins=common_bin_edges)
+        
+        # 4. Interpolate PX5 cumulative data into the exact same UI bins
+        interp_px5 = np.interp(common_bin_edges, self.daq_t_s, self.px5Cum)
+        px5_bins_trunc = np.diff(interp_px5)
+
+        # 5. Normalize
+        adva_norm = adva_bins - np.mean(adva_bins)
+        px5_norm = px5_bins_trunc - np.mean(px5_bins_trunc)
+
+        # 6. Cross-Correlate
+        correlation = correlate(adva_norm, px5_norm, mode='full')
+        lags = correlation_lags(len(adva_norm), len(px5_norm), mode='full')
+        lag_times_s = lags * bin_s
+
+        max_idx = np.argmax(correlation)
+        best_lag_s = lag_times_s[max_idx]
+
+        self.btn_sync.configure(text="RUN SYNC TEST (CO-57)", state="normal")
+        
+        res = f"\n--- SYNC CALIBRATION ---\nTime Window: {t_start} - {t_end} s\nBin Size: {bin_s*1e6:.1f} µs\nFound Math Peak: {best_lag_s*1000:.3f} ms\n"
+        self.results_txt.configure(state="normal")
+        self.results_txt.insert("end", res)
+        self.results_txt.see("end")
+        self.results_txt.configure(state="disabled")
+
+        # 7. Clean TopLevel Plot (No ghost UI figures)
+        top = ctk.CTkToplevel(self)
+        top.title(f"Coincidence Check ({e_min}-{e_max} keV)")
+        top.geometry("800x500")
+        
+        fig = plt.Figure(figsize=(8, 5))
+        ax = fig.add_subplot(111)
+        ax.plot(lag_times_s * 1000, correlation, color='#9467bd', linewidth=1.5)
+        ax.axvline(best_lag_s * 1000, color='red', linestyle='--', linewidth=2, label=f'Math Peak = {best_lag_s * 1000:.3f} ms')
+        
+        ax.set_title("Co-57 Coincidence Time Resolution", fontweight='bold')
+        ax.set_xlabel(r"Time Difference ($\Delta t$) [ms]")
+        ax.set_ylabel("Correlation Coefficient")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        
+        canvas = FigureCanvasTkAgg(fig, master=top)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        
     # ==============================================================================
     # REFACTORED NON-BLOCKING UPDATE PIPELINE
     # ==============================================================================
