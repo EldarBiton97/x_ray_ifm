@@ -12,7 +12,9 @@ from numba import njit
 from scipy.signal import correlate, correlation_lags  # <--- Added for Sync Test
 import re
 import mmap
-
+import threading
+import queue
+ 
 # ==============================================================================
 # PART 1: THE T3P PARSER & STRICT GEOMETRY VALIDATION
 # DAQ/PX5-LOCKED VERSION (SEQUENTIAL STATE MACHINE)
@@ -536,6 +538,9 @@ class AnalysisApp(ctk.CTk):
         self.title("Master IFM Dashboard")
         self.geometry("1600x950")
         
+        self.calc_queue = queue.Queue()
+        self.is_calculating = False
+
         self.raw_t, self.raw_tot, self.raw_matrix = raw_t, raw_tot, raw_matrix
         self.calib_mats = (a_m, b_m, c_m, t_m)
         self.daq_t_s, self.px5Cum = daq_t_s, px5Cum
@@ -696,106 +701,15 @@ class AnalysisApp(ctk.CTk):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # ==============================================================================
-    # INTEGRATED CROSS-CORRELATION ENGINE
-    # ==============================================================================
-    # ==============================================================================
-    # INTEGRATED CROSS-CORRELATION ENGINE (PATCHED)
-    # ==============================================================================
-    def run_sync_test(self):
-        if not self.has_h5:
-            self.results_txt.configure(state="normal")
-            self.results_txt.insert("end", "\n[ERROR] No PX5 data loaded.\n")
-            self.results_txt.configure(state="disabled")
-            return
-
-        if self.t_s is None: self.update_plots()
-        if len(self.daq_t_s) < 2: return
-        
-        # 1. Obey the UI Time Zoom and UI Bin Size!
-        t_start = self.get_float(self.t_min)
-        t_end = self.get_float(self.t_max)
-        bin_s = self.get_float(self.bin_ms) / 1000.0
-
-        if bin_s <= 0 or t_end <= t_start: return
-
-        # 2. Filter AdvaPIX Energy
-        e_min, e_max = self.get_float(self.e_min), self.get_float(self.e_max)
-        selected_engine = self.engine_drop.get()
-        
-        has_valid_e = ~np.isnan(self.energy)
-        good_energy_cluster = (self.bad_e_counts == 0)
-        in_energy_range = has_valid_e & (self.energy >= e_min) & (self.energy <= e_max)
-        
-        if "2." in selected_engine: counting_mask = in_energy_range & good_energy_cluster
-        else: counting_mask = in_energy_range
-
-        # Apply BOTH Energy AND Time constraints
-        time_mask = (self.t_s >= t_start) & (self.t_s <= t_end)
-        filtered_t_s = self.t_s[counting_mask & time_mask]
-
-        if len(filtered_t_s) == 0:
-            self.results_txt.configure(state="normal")
-            self.results_txt.insert("end", f"\n[ERROR] No AdvaPIX hits in {e_min}-{e_max} keV between {t_start}-{t_end}s.\n")
-            self.results_txt.configure(state="disabled")
-            return
-
-        self.btn_sync.configure(text="CALCULATING...", state="disabled")
-        self.update()
-
-        # 3. Bin AdvaPIX data using the UI bin size
-        common_bin_edges = np.arange(t_start, t_end + bin_s, bin_s)
-        adva_bins, _ = np.histogram(filtered_t_s, bins=common_bin_edges)
-        
-        # 4. Interpolate PX5 cumulative data into the exact same UI bins
-        interp_px5 = np.interp(common_bin_edges, self.daq_t_s, self.px5Cum)
-        px5_bins_trunc = np.diff(interp_px5)
-
-        # 5. Normalize
-        adva_norm = adva_bins - np.mean(adva_bins)
-        px5_norm = px5_bins_trunc - np.mean(px5_bins_trunc)
-
-        # 6. Cross-Correlate
-        correlation = correlate(adva_norm, px5_norm, mode='full')
-        lags = correlation_lags(len(adva_norm), len(px5_norm), mode='full')
-        lag_times_s = lags * bin_s
-
-        max_idx = np.argmax(correlation)
-        best_lag_s = lag_times_s[max_idx]
-
-        self.btn_sync.configure(text="RUN SYNC TEST (CO-57)", state="normal")
-        
-        res = f"\n--- SYNC CALIBRATION ---\nTime Window: {t_start} - {t_end} s\nBin Size: {bin_s*1e6:.1f} µs\nFound Math Peak: {best_lag_s*1000:.3f} ms\n"
-        self.results_txt.configure(state="normal")
-        self.results_txt.insert("end", res)
-        self.results_txt.see("end")
-        self.results_txt.configure(state="disabled")
-
-        # 7. Clean TopLevel Plot (No ghost UI figures)
-        top = ctk.CTkToplevel(self)
-        top.title(f"Coincidence Check ({e_min}-{e_max} keV)")
-        top.geometry("800x500")
-        
-        fig = plt.Figure(figsize=(8, 5))
-        ax = fig.add_subplot(111)
-        ax.plot(lag_times_s * 1000, correlation, color='#9467bd', linewidth=1.5)
-        ax.axvline(best_lag_s * 1000, color='red', linestyle='--', linewidth=2, label=f'Math Peak = {best_lag_s * 1000:.3f} ms')
-        
-        ax.set_title("Co-57 Coincidence Time Resolution", fontweight='bold')
-        ax.set_xlabel(r"Time Difference ($\Delta t$) [ms]")
-        ax.set_ylabel("Correlation Coefficient")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        
-        canvas = FigureCanvasTkAgg(fig, master=top)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-
-    # ==============================================================================
-    # EXISTING UPDATE PIPELINE
+    # REFACTORED NON-BLOCKING UPDATE PIPELINE
     # ==============================================================================
     def update_plots(self):
-        self.btn_update.configure(state="disabled", text="CALCULATING...")
+        # Prevent multiple threads from spawning if the user spam-clicks
+        if self.is_calculating: 
+            return 
+            
+        self.is_calculating = True
+        self.btn_update.configure(state="disabled", text="INITIALIZING...")
         self.update()
         
         selected_engine = self.engine_drop.get()
@@ -803,6 +717,7 @@ class AnalysisApp(ctk.CTk):
         span_ns = self.get_float(self.cs_max_span, 100.0)
         if window_ns <= 0: window_ns = 50.0
         if span_ns < window_ns: span_ns = window_ns
+        
         self.cs_window.delete(0, "end"); self.cs_window.insert(0, str(window_ns))
         self.cs_max_span.delete(0, "end"); self.cs_max_span.insert(0, str(span_ns))
         
@@ -810,22 +725,62 @@ class AnalysisApp(ctk.CTk):
         else: state_key = f"{selected_engine}_{window_ns}_{span_ns}"
         
         if self.cached_engine != state_key:
-            self.btn_update.configure(text="PROCESSING RAW BINARY...")
+            self.btn_update.configure(text="PROCESSING RAW BINARY... (PLEASE WAIT)")
             self.update()
             
-            a_m, b_m, c_m, t_m = self.calib_mats
+            # 1. Spawn a background thread for the heavy Numba math
+            thread = threading.Thread(
+                target=self._run_numba_pipeline, 
+                args=(selected_engine, window_ns, span_ns, state_key),
+                daemon=True # Ensures thread closes if the app is closed
+            )
+            thread.start()
             
-            if "1." in selected_engine:
-                self.x, self.y, self.energy, self.tot, self.t_s, self.cluster_sizes, self.bad_e_counts, self.span_rejected = cpu_fast_pipeline(
-                    self.raw_t, self.raw_tot, self.raw_matrix, a_m, b_m, c_m, t_m
-                )
-            elif "2." in selected_engine:
-                self.x, self.y, self.energy, self.tot, self.t_s, self.cluster_sizes, self.bad_e_counts, self.span_rejected = cpu_cluster_pipeline_fixed(
-                    self.raw_t, self.raw_tot, self.raw_matrix, a_m, b_m, c_m, t_m, window_ns/1e9, span_ns/1e9
-                )
-            
-            self.cached_engine = state_key 
+            # 2. Tell the UI to check back in 100 milliseconds
+            self.after(100, self._check_calculation_queue)
+        else:
+            # Data is already cached, jump straight to plotting
+            self.btn_update.configure(text="UPDATING PLOTS...")
+            self.update()
+            self._finish_update_plots()
 
+    def _run_numba_pipeline(self, selected_engine, window_ns, span_ns, state_key):
+        """ THIS RUNS IN A BACKGROUND THREAD - NO GUI UPDATES HERE """
+        a_m, b_m, c_m, t_m = self.calib_mats
+        
+        if "1." in selected_engine:
+            res = cpu_fast_pipeline(
+                self.raw_t, self.raw_tot, self.raw_matrix, a_m, b_m, c_m, t_m
+            )
+        elif "2." in selected_engine:
+            res = cpu_cluster_pipeline_fixed(
+                self.raw_t, self.raw_tot, self.raw_matrix, a_m, b_m, c_m, t_m, window_ns/1e9, span_ns/1e9
+            )
+            
+        # Push the results to the queue for the main thread to pick up
+        self.calc_queue.put((state_key, res))
+
+    def _check_calculation_queue(self):
+        """ POLLER: Checks if the background thread has finished """
+        try:
+            # Try to grab the data (fails immediately if not ready)
+            state_key, res = self.calc_queue.get_nowait()
+            
+            # Unpack results safely back onto the main UI thread
+            self.x, self.y, self.energy, self.tot, self.t_s, self.cluster_sizes, self.bad_e_counts, self.span_rejected = res
+            self.cached_engine = state_key
+            
+            self.btn_update.configure(text="UPDATING PLOTS...")
+            self.update()
+            self._finish_update_plots()
+            
+        except queue.Empty:
+            # Data isn't ready yet. Check again in 100ms.
+            self.after(100, self._check_calculation_queue)
+
+    def _finish_update_plots(self):
+        """ MATPLOTLIB UPDATES - RUNS ON MAIN THREAD """
+        selected_engine = self.engine_drop.get()
         e_min, e_max = self.get_float(self.e_min), self.get_float(self.e_max)
         
         has_valid_e = ~np.isnan(self.energy)
@@ -979,7 +934,10 @@ class AnalysisApp(ctk.CTk):
                 res_text += f"Error: Reference P{ref_idx+1} has 0 counts\n"
 
         self.results_txt.configure(state="normal"); self.results_txt.delete("0.0", "end"); self.results_txt.insert("0.0", res_text); self.results_txt.configure(state="disabled")
+        
+        # Reset the UI state flags
         self.btn_update.configure(state="normal", text="UPDATE DASHBOARD")
+        self.is_calculating = False
 
 # ==============================================================================
 # PART 4: EXECUTION & VALIDATION
