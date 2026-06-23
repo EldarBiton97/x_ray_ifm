@@ -20,16 +20,28 @@ import queue
 # ==============================================================================
 # PART 1: THE T3P PARSER & STRICT GEOMETRY VALIDATION
 # ==============================================================================
-def _unwrap_28bit_ticks(raw_ticks, period=268435456.0):
+def _unwrap_28bit_ticks(raw_ticks, period=268435456.0, last_raw=None, current_cycles=0):
     raw_ticks = np.asarray(raw_ticks, dtype=np.float64)
-    if raw_ticks.size == 0: return raw_ticks.copy()
+    if raw_ticks.size == 0: return raw_ticks.copy(), last_raw, current_cycles
+    
+    if last_raw is not None:
+        deltas = np.diff(np.insert(raw_ticks, 0, last_raw))
+    else:
+        deltas = np.diff(raw_ticks)
+        
     half_period = period / 2.0
-    deltas = np.diff(raw_ticks)
     roll_forward = (deltas < -half_period).astype(np.int64)
     roll_backward = (deltas > half_period).astype(np.int64)
+    
     cycles = np.zeros(raw_ticks.size, dtype=np.int64)
-    cycles[1:] = np.cumsum(roll_forward - roll_backward)
-    return raw_ticks + cycles * period
+    if last_raw is not None:
+        cycles = np.cumsum(roll_forward - roll_backward) + current_cycles
+    else:
+        cycles[1:] = np.cumsum(roll_forward - roll_backward)
+        cycles += current_cycles
+        
+    unwrapped = raw_ticks + cycles * period
+    return unwrapped, raw_ticks[-1], cycles[-1]
 
 def _deduplicate_heartbeat_ticks(raw_trigger_ticks, min_separation_ticks=20_000_000.0, period=268435456.0):
     raw_trigger_ticks = np.asarray(raw_trigger_ticks, dtype=np.float64)
@@ -66,16 +78,24 @@ def _build_heartbeat_daq_times(heartbeat_ticks, expected_ticks_per_second=40_000
     heartbeat_daq_times[1:] = np.cumsum(steps).astype(np.float64)
     return heartbeat_daq_times, intervals, steps, residual_ticks
 
-def load_advacam_t3p(filepath, *, strict_two_chip=True, max_unmapped_fraction=1e-6, expected_ticks_per_second=40_000_000.0, heartbeat_duplicate_separation_ticks=20_000_000.0, drop_unanchored_photons=True):
+def load_advacam_t3p(filepath, state=None, strict_two_chip=True, expected_ticks_per_second=40_000_000.0, heartbeat_duplicate_separation_ticks=20_000_000.0):
     print(f"Loading Timepix3 data from {os.path.basename(filepath)}...")
-    hw_trigger_pattern = re.compile(rb'\d+\t\d+\t\d+\t\d+\t\d+\t\d+\r?\n')
     
-    raw_trigger_ticks = []
-    binary_chunks = []
+    if state is None:
+        state = {
+            'chips': {}, 
+            'hb': {'last_raw': None, 'cycles': 0},
+            'last_hb_tick': None,
+            'last_daq_time': 0.0,
+            'last_interval_ticks': expected_ticks_per_second
+        }
+
+    hw_trigger_pattern = re.compile(rb'\d+\t\d+\t\d+\t\d+\t\d+\t\d+\r?\n')
+    raw_trigger_ticks, binary_chunks = [], []
     
     with open(filepath, "rb") as f:
         f.seek(0, 2)
-        if f.tell() == 0: raise ValueError("File is empty.")
+        if f.tell() == 0: return np.array([]), np.array([]), np.array([]), state
         f.seek(0)
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         last_idx = 0
@@ -85,15 +105,10 @@ def load_advacam_t3p(filepath, *, strict_two_chip=True, max_unmapped_fraction=1e
             valid_len = (len(chunk) // 16) * 16
             if valid_len > 0: binary_chunks.append(chunk[:valid_len])
                 
-            text_str = match.group(0).decode('ascii', errors='ignore').strip()
-            parts = text_str.split('\t')
-            if len(parts) == 6:
-                trigger_id = int(parts[5])
-                if trigger_id == 10:
-                    try:
-                        heartbeat_toa = int(parts[2]) & 0x0FFFFFFF
-                        raw_trigger_ticks.append(float(heartbeat_toa))
-                    except ValueError: pass
+            parts = match.group(0).decode('ascii', errors='ignore').strip().split('\t')
+            if len(parts) == 6 and int(parts[5]) == 10:
+                try: raw_trigger_ticks.append(float(int(parts[2]) & 0x0FFFFFFF))
+                except ValueError: pass
             last_idx = end
             
         chunk = mm[last_idx:]
@@ -101,66 +116,96 @@ def load_advacam_t3p(filepath, *, strict_two_chip=True, max_unmapped_fraction=1e
         if valid_len > 0: binary_chunks.append(chunk[:valid_len])
         mm.close()
 
-    binary_data = b"".join(binary_chunks)
-    dt = np.dtype([("matrixIdx", "<u4"), ("toa", "<u8"), ("overflow", "u1"), ("ftoa", "u1"), ("tot", "<u2")])
-    data = np.frombuffer(binary_data, dtype=dt)
+    data = np.frombuffer(b"".join(binary_chunks), dtype=np.dtype([("matrixIdx", "<u4"), ("toa", "<u8"), ("overflow", "u1"), ("ftoa", "u1"), ("tot", "<u2")]))
+    if len(data) == 0: return np.array([]), np.array([]), np.array([]), state
 
-    if len(data) == 0: return np.array([]), np.array([]), np.array([])
-
-    if strict_two_chip: valid_mask = data["matrixIdx"] < 131072
-    else: valid_mask = data["matrixIdx"] < 262144
-
+    valid_mask = data["matrixIdx"] < (131072 if strict_two_chip else 262144)
     clean_data = data[valid_mask]
-    if len(clean_data) == 0: return np.array([]), np.array([]), np.array([])
+    if len(clean_data) == 0: return np.array([]), np.array([]), np.array([]), state
 
     matrixIdx = clean_data["matrixIdx"].astype(np.uint32)
-    ftoa = clean_data["ftoa"].astype(np.float64)
-    tot = clean_data["tot"].astype(np.float64)
+    ftoa, tot = clean_data["ftoa"].astype(np.float64), clean_data["tot"].astype(np.float64)
     raw_toa = (clean_data["toa"] & 0x0FFFFFFF).astype(np.float64)
 
+    # 1. Global Unwrap Photons (Preserves 6.71s clock across files)
     unwrapped_toa = np.zeros_like(raw_toa, dtype=np.float64)
     chip_ids = matrixIdx // 65536
-
     for cid in np.unique(chip_ids):
         mask = (chip_ids == cid)
         c_toa = raw_toa[mask]
-        if c_toa.size > 0: unwrapped_toa[mask] = _unwrap_28bit_ticks(c_toa)
+        if c_toa.size > 0:
+            c_st = state['chips'].get(cid, {'last_raw': None, 'cycles': 0})
+            u_toa, l_raw, cyc = _unwrap_28bit_ticks(c_toa, last_raw=c_st['last_raw'], current_cycles=c_st['cycles'])
+            unwrapped_toa[mask] = u_toa
+            state['chips'][cid] = {'last_raw': l_raw, 'cycles': cyc}
 
     photon_tick_fine = unwrapped_toa - (ftoa / 16.0)
 
-    if len(raw_trigger_ticks) < 2:
+    # 2. Global Unwrap Heartbeats
+    if len(raw_trigger_ticks) > 0:
+        hb_unwrapped, hb_l_raw, hb_cyc = _unwrap_28bit_ticks(raw_trigger_ticks, last_raw=state['hb']['last_raw'], current_cycles=state['hb']['cycles'])
+        state['hb'] = {'last_raw': hb_l_raw, 'cycles': hb_cyc}
+        
+        groups, current_group = [], [hb_unwrapped[0]]
+        for val in hb_unwrapped[1:]:
+            if (val - current_group[-1]) < heartbeat_duplicate_separation_ticks: current_group.append(val)
+            else:
+                groups.append(current_group)
+                current_group = [val]
+        groups.append(current_group)
+        heartbeat_ticks = np.array([np.median(g) for g in groups], dtype=np.float64)
+    else: heartbeat_ticks = np.array([], dtype=np.float64)
+
+    # 3. Build Global Anchor Timeline
+    current_anchors_ticks, current_anchors_times = [], []
+    if heartbeat_ticks.size > 0:
+        if state['last_hb_tick'] is not None:
+            prev_tick, prev_time = state['last_hb_tick'], state['last_daq_time']
+        else:
+            prev_tick, prev_time = heartbeat_ticks[0], 0.0
+            current_anchors_ticks.append(prev_tick); current_anchors_times.append(prev_time)
+            heartbeat_ticks = heartbeat_ticks[1:]
+            
+        for hb in heartbeat_ticks:
+            interval = hb - prev_tick
+            step = max(1, int(np.rint(interval / expected_ticks_per_second)))
+            new_time = prev_time + float(step)
+            current_anchors_ticks.append(hb); current_anchors_times.append(new_time)
+            
+            state['last_interval_ticks'] = interval / step
+            prev_tick, prev_time = hb, new_time
+            
+        state['last_hb_tick'], state['last_daq_time'] = prev_tick, prev_time
+
+    # Combine memory anchors with current anchors
+    valid_anchor_ticks = ([state['last_hb_tick']] if state['last_hb_tick'] is not None else []) + current_anchors_ticks
+    valid_anchor_times = ([state['last_daq_time']] if state['last_hb_tick'] is not None else []) + current_anchors_times
+    valid_anchor_ticks = np.array(valid_anchor_ticks, dtype=np.float64)
+    valid_anchor_times = np.array(valid_anchor_times, dtype=np.float64)
+
+    # 4. EXTRAPOLATION PATCH (The fix for slices falling between photons)
+    if valid_anchor_ticks.size >= 2:
+        hb_indices = np.searchsorted(valid_anchor_ticks, photon_tick_fine, side="right") - 1
+        
+        # Clip indices to nearest valid interval to seamlessly bridge gaps
+        max_valid_idx = valid_anchor_ticks.size - 2
+        hb_indices = np.clip(hb_indices, 0, max_valid_idx)
+        
+        H0 = valid_anchor_ticks[hb_indices]; H1 = valid_anchor_ticks[hb_indices + 1]
+        T0 = valid_anchor_times[hb_indices]; T1 = valid_anchor_times[hb_indices + 1]
+        
+        interval_ticks, interval_seconds = H1 - H0, T1 - T0
+        time_s = T0 + ((photon_tick_fine - H0) / interval_ticks) * interval_seconds
+        
+    elif valid_anchor_ticks.size == 1:
+        # Project linearly using the last known clock speed
+        H0, T0 = valid_anchor_ticks[0], valid_anchor_times[0]
+        time_s = T0 + (photon_tick_fine - H0) / state['last_interval_ticks']
+    else:
         time_s = photon_tick_fine / expected_ticks_per_second
-        sort_idx = np.argsort(time_s)
-        return time_s[sort_idx], tot[sort_idx], matrixIdx[sort_idx]
-
-    heartbeat_ticks = _deduplicate_heartbeat_ticks(raw_trigger_ticks, min_separation_ticks=heartbeat_duplicate_separation_ticks)
-    if heartbeat_ticks.size < 2:
-        time_s = photon_tick_fine / expected_ticks_per_second
-        sort_idx = np.argsort(time_s)
-        return time_s[sort_idx], tot[sort_idx], matrixIdx[sort_idx]
-
-    heartbeat_daq_times, _, _, _ = _build_heartbeat_daq_times(heartbeat_ticks, expected_ticks_per_second=expected_ticks_per_second)
-
-    hb_indices = np.searchsorted(heartbeat_ticks, photon_tick_fine, side="right") - 1
-    anchored = (hb_indices >= 0) & (hb_indices < heartbeat_ticks.size - 1)
-
-    matrixIdx = matrixIdx[anchored]
-    tot = tot[anchored]
-    photon_tick_fine = photon_tick_fine[anchored]
-    hb_indices = hb_indices[anchored]
-
-    H0 = heartbeat_ticks[hb_indices]
-    H1 = heartbeat_ticks[hb_indices + 1]
-    T0 = heartbeat_daq_times[hb_indices]
-    T1 = heartbeat_daq_times[hb_indices + 1]
-
-    interval_ticks = H1 - H0
-    interval_seconds = T1 - T0
-    frac = (photon_tick_fine - H0) / interval_ticks
-    time_s = T0 + frac * interval_seconds
 
     sort_idx = np.argsort(time_s)
-    return time_s[sort_idx], tot[sort_idx], matrixIdx[sort_idx]
+    return time_s[sort_idx], tot[sort_idx], matrixIdx[sort_idx], state
 
 def load_calibration_matrices(xml_filepath):
     print(f"Extracting surrogate calibration matrices from {os.path.basename(xml_filepath)}...")
@@ -364,6 +409,7 @@ class AnalysisApp(ctk.CTk):
         super().__init__()
         self.title("Master IFM Dashboard (Live Streaming)")
         self.geometry("1600x950")
+        self.parser_state = None
         
         # UI & Calculation State
         self.calc_queue = queue.Queue()
@@ -381,7 +427,6 @@ class AnalysisApp(ctk.CTk):
         self.has_h5 = False
         
         # Stitching Anchors
-        self.last_adva_time = 0.0
         self.last_px5_time = 0.0
         self.last_px5_cum = 0.0
 
@@ -548,8 +593,10 @@ class AnalysisApp(ctk.CTk):
             t3p = self.t3p_files[self.file_idx]
             h5 = self.h5_files[self.file_idx] if self.file_idx < len(self.h5_files) else None
             
-            # Read files
-            new_t, new_tot, new_matrix = load_advacam_t3p(t3p, drop_unanchored_photons=False)
+            # Read files WITH STATE
+            new_t, new_tot, new_matrix, self.parser_state = load_advacam_t3p(
+                t3p, state=self.parser_state
+            )
             new_daq_t, new_px5_c = load_daq_h5(h5) if h5 else (np.array([]), np.array([]))
             
             self.file_loader_queue.put((new_t, new_tot, new_matrix, new_daq_t, new_px5_c))
@@ -558,22 +605,17 @@ class AnalysisApp(ctk.CTk):
     def _check_file_loader(self):
         try:
             new_t, new_tot, new_matrix, new_daq_t, new_px5_c = self.file_loader_queue.get_nowait()
-            
-            # --- Chronological Time Stitching ---
-            if len(new_t) > 0:
-                new_t += self.last_adva_time
-                self.last_adva_time = np.max(new_t)
                 
             if len(new_daq_t) > 0:
                 if len(self.daq_t_s) > 0:
-                    # Drop the leading zero for all subsequent files so bin intervals align perfectly
+                    # Stitch the DAQ bins consecutively
                     new_daq_t = new_daq_t[1:] + self.last_px5_time
                     new_px5_c = new_px5_c[1:] + self.last_px5_cum
                 
                 if len(new_daq_t) > 0:
                     self.last_px5_time = new_daq_t[-1]
                     self.last_px5_cum = new_px5_c[-1]
-
+            # ...
             # Append Arrays
             self.raw_t = np.concatenate((self.raw_t, new_t)) if len(self.raw_t) > 0 else new_t
             self.raw_tot = np.concatenate((self.raw_tot, new_tot)) if len(self.raw_tot) > 0 else new_tot
