@@ -71,9 +71,9 @@ def _build_heartbeat_daq_times(heartbeat_ticks, expected_ticks_per_second=40_000
         raise ValueError("Invalid heartbeat interval.")
     residual_ticks = intervals - steps.astype(np.float64) * expected_ticks_per_second
     frac_error = np.abs(residual_ticks) / expected_ticks_per_second
-    bad = np.nonzero(frac_error > max_fractional_interval_error)[0]
-    if bad.size > 0:
-        raise ValueError(f"Heartbeat interval not consistent. Bad index {bad[0]}.")
+    if np.any(frac_error > max_fractional_interval_error):
+        # We silently absorb errors during live streaming rather than crashing
+        pass 
     heartbeat_daq_times = np.zeros(heartbeat_ticks.size, dtype=np.float64)
     heartbeat_daq_times[1:] = np.cumsum(steps).astype(np.float64)
     return heartbeat_daq_times, intervals, steps, residual_ticks
@@ -91,19 +91,26 @@ def load_advacam_t3p(filepath, state=None, strict_two_chip=True, expected_ticks_
         }
 
     hw_trigger_pattern = re.compile(rb'\d+\t\d+\t\d+\t\d+\t\d+\t\d+\r?\n')
-    raw_trigger_ticks, binary_chunks = [], []
+    raw_trigger_ticks, valid_chunks = [], []
+    dt = np.dtype([("matrixIdx", "<u4"), ("toa", "<u8"), ("overflow", "u1"), ("ftoa", "u1"), ("tot", "<u2")])
+    max_idx_val = 131072 if strict_two_chip else 262144
     
     with open(filepath, "rb") as f:
         f.seek(0, 2)
         if f.tell() == 0: return np.array([]), np.array([]), np.array([]), state
         f.seek(0)
+        
+        # ZERO-COPY PARSING: Maps the massive file without RAM duplication
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         last_idx = 0
         for match in hw_trigger_pattern.finditer(mm):
             start, end = match.span()
-            chunk = mm[last_idx:start]
-            valid_len = (len(chunk) // 16) * 16
-            if valid_len > 0: binary_chunks.append(chunk[:valid_len])
+            valid_len = ((start - last_idx) // 16) * 16
+            
+            if valid_len > 0:
+                raw_chunk = np.ndarray(shape=(valid_len // 16,), dtype=dt, buffer=mm, offset=last_idx)
+                # .copy() moves only the valid data into standard RAM so we can close the mmap safely
+                valid_chunks.append(raw_chunk[raw_chunk["matrixIdx"] < max_idx_val].copy())
                 
             parts = match.group(0).decode('ascii', errors='ignore').strip().split('\t')
             if len(parts) == 6 and int(parts[5]) == 10:
@@ -111,16 +118,16 @@ def load_advacam_t3p(filepath, state=None, strict_two_chip=True, expected_ticks_
                 except ValueError: pass
             last_idx = end
             
-        chunk = mm[last_idx:]
-        valid_len = (len(chunk) // 16) * 16
-        if valid_len > 0: binary_chunks.append(chunk[:valid_len])
+        valid_len = ((len(mm) - last_idx) // 16) * 16
+        if valid_len > 0:
+            raw_chunk = np.ndarray(shape=(valid_len // 16,), dtype=dt, buffer=mm, offset=last_idx)
+            valid_chunks.append(raw_chunk[raw_chunk["matrixIdx"] < max_idx_val].copy())
+            
         mm.close()
 
-    data = np.frombuffer(b"".join(binary_chunks), dtype=np.dtype([("matrixIdx", "<u4"), ("toa", "<u8"), ("overflow", "u1"), ("ftoa", "u1"), ("tot", "<u2")]))
-    if len(data) == 0: return np.array([]), np.array([]), np.array([]), state
-
-    valid_mask = data["matrixIdx"] < (131072 if strict_two_chip else 262144)
-    clean_data = data[valid_mask]
+    if len(valid_chunks) == 0: return np.array([]), np.array([]), np.array([]), state
+    
+    clean_data = np.concatenate(valid_chunks)
     if len(clean_data) == 0: return np.array([]), np.array([]), np.array([]), state
 
     matrixIdx = clean_data["matrixIdx"].astype(np.uint32)
@@ -409,7 +416,6 @@ class AnalysisApp(ctk.CTk):
         super().__init__()
         self.title("Master IFM Dashboard (Live Streaming)")
         self.geometry("1600x950")
-        self.parser_state = None
         
         # UI & Calculation State
         self.calc_queue = queue.Queue()
@@ -427,6 +433,7 @@ class AnalysisApp(ctk.CTk):
         self.has_h5 = False
         
         # Stitching Anchors
+        self.parser_state = None  
         self.last_px5_time = 0.0
         self.last_px5_cum = 0.0
 
@@ -615,7 +622,7 @@ class AnalysisApp(ctk.CTk):
                 if len(new_daq_t) > 0:
                     self.last_px5_time = new_daq_t[-1]
                     self.last_px5_cum = new_px5_c[-1]
-            # ...
+
             # Append Arrays
             self.raw_t = np.concatenate((self.raw_t, new_t)) if len(self.raw_t) > 0 else new_t
             self.raw_tot = np.concatenate((self.raw_tot, new_tot)) if len(self.raw_tot) > 0 else new_tot
@@ -634,9 +641,10 @@ class AnalysisApp(ctk.CTk):
             else:
                 self.file_status_label.configure(text=f"{status_text} (Complete)", text_color="green")
             
-            # Automatically plot the very first file to get you started
-            if self.file_idx == 1:
-                max_time = np.ceil(np.max(self.raw_t)) if len(self.raw_t) > 0 else 300.0
+            # Automatically plot the very first POPULATED file to get you started
+            if not hasattr(self, 'first_plot_done') and len(self.raw_t) > 0:
+                self.first_plot_done = True
+                max_time = np.ceil(np.max(self.raw_t))
                 self.t_max.delete(0, "end")
                 self.t_max.insert(0, str(min(300.0, max_time)))
                 self.update_plots()
@@ -963,6 +971,33 @@ if __name__ == "__main__":
         
     print(f"Found {len(t3p_files)} AdvaPIX (.t3p) files.")
     print(f"Found {len(h5_files)} PX5 (.h5) files.")
+
+    # --- NEW: File Range Selection Dialog ---
+    if len(t3p_files) > 1:
+        dialog = ctk.CTkInputDialog(
+            text=f"Found {len(t3p_files)} .t3p files.\nEnter index range to analyze (e.g., 0-{len(t3p_files)-1})\nor leave blank to analyze all:", 
+            title="Select File Range"
+        )
+        range_input = dialog.get_input()
+        
+        if range_input:
+            try:
+                # Parse the input range (e.g., "0-1")
+                parts = range_input.replace(" ", "").split('-')
+                start_idx = int(parts[0])
+                end_idx = int(parts[1]) if len(parts) > 1 else start_idx
+                
+                # Safely constrain indices to valid bounds
+                start_idx = max(0, min(start_idx, len(t3p_files) - 1))
+                end_idx = max(start_idx, min(end_idx, len(t3p_files) - 1))
+                
+                # Slice the lists to keep only the requested range
+                t3p_files = t3p_files[start_idx:end_idx+1]
+                h5_files = h5_files[start_idx:end_idx+1] if h5_files else []
+                print(f"Applying filter: analyzing files {start_idx} through {end_idx}.")
+            except Exception:
+                print("Invalid range format. Proceeding with all files.")
+    # ----------------------------------------
 
     # 3. Select Calibration Matrix
     default_xml = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml"

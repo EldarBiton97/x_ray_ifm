@@ -1036,8 +1036,8 @@ class AnalysisApp(ctk.CTk):
 # PART 4: EXECUTION & VALIDATION
 # ==============================================================================
 if __name__ == "__main__":
-    t3p_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_r1.t3p"
-    h5_file = r"G:\האחסון שלי\X-Ray-IFM\Test Files\Sync_test\sync_test_25.5_px5_data_001.h5"
+    t3p_file = r"C:\IFM\Sync_meas_23.6\sync_23.6_r2.t3p"
+    h5_file = r"C:\IFM\Sync_meas_23.6\sync_23.6_002.h5"
     xml_file = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml" 
 
     t_sec, tot_hits, matrix_idx = load_advacam_t3p(t3p_file)
