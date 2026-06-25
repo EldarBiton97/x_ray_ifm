@@ -16,7 +16,13 @@ import re
 import mmap
 import threading
 import queue
- 
+
+# Try importing psutil for the live memory monitor
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 # ==============================================================================
 # PART 1: THE T3P PARSER & STRICT GEOMETRY VALIDATION
 # ==============================================================================
@@ -214,6 +220,45 @@ def load_advacam_t3p(filepath, state=None, strict_two_chip=True, expected_ticks_
     sort_idx = np.argsort(time_s)
     return time_s[sort_idx], tot[sort_idx], matrixIdx[sort_idx], state
 
+
+# ==============================================================================
+# SPARSE PX5 HDF5 PARSER (MEMORY EFFICIENT)
+# ==============================================================================
+def load_daq_h5(filepath):
+    """
+    Parses a massive PX5 dense histogram and extracts ONLY the photon event timestamps.
+    Prevents NumPy MemoryErrors on >1 billion bin arrays.
+    Returns: (event_timestamps, total_file_duration_in_seconds)
+    """
+    if not filepath or not os.path.exists(filepath): return np.array([]), 0.0
+    
+    with h5py.File(filepath, 'r') as f:
+        dataset = f['px5CountsPerBin']
+        bin_s = f.attrs['bin_s']
+        n_bins = dataset.shape[0]
+        file_duration = n_bins * bin_s
+        
+        chunk_size = 10_000_000 # Read in safe 10M chunks to keep RAM usage ~100MB max
+        event_times = []
+        
+        for i in range(0, n_bins, chunk_size):
+            chunk = dataset[i:i+chunk_size]
+            # Find indices where photons actually arrived
+            non_zeros = np.nonzero(chunk)[0]
+            if len(non_zeros) > 0:
+                counts = chunk[non_zeros]
+                # Convert bin index to absolute time in seconds
+                times = (non_zeros + i) * bin_s
+                
+                # If a bin recorded multiple hits, duplicate the timestamp so histogram counts correctly
+                if np.any(counts > 1):
+                    times = np.repeat(times, counts.astype(np.int32))
+                event_times.append(times)
+                
+    if len(event_times) > 0:
+        return np.concatenate(event_times), file_duration
+    return np.array([], dtype=np.float64), file_duration
+
 def load_calibration_matrices(xml_filepath):
     print(f"Extracting surrogate calibration matrices from {os.path.basename(xml_filepath)}...")
     tree = ET.parse(xml_filepath)
@@ -224,6 +269,7 @@ def load_calibration_matrices(xml_filepath):
         data_list = [np.frombuffer(base64.b64decode(tag.text.strip()), dtype=np.float64) for tag in tags]
         matrices[param] = np.concatenate(data_list)
     return matrices['caliba'], matrices['calibb'], matrices['calibc'], matrices['calibt']
+
 
 # ==============================================================================
 # PART 2: THE RE-ENGINEERED HARDWARE PIPELINES
@@ -401,13 +447,6 @@ def fast_roi_filter(x, y, t, tot, e, bad_e, x0, x1, y0, y1, t0, t1):
             idx += 1
     return t_out, tot_out, e_out, bad_e_out
 
-def load_daq_h5(filepath):
-    if not filepath or not os.path.exists(filepath): return np.array([]), np.array([])
-    with h5py.File(filepath, 'r') as f:
-        px5_counts, bin_s = f['px5CountsPerBin'][:], f.attrs['bin_s']
-    px5Cum = np.concatenate(([0], np.cumsum(px5_counts, dtype=np.float64)))
-    return np.arange(len(px5Cum)) * bin_s, px5Cum
-
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
@@ -429,13 +468,12 @@ class AnalysisApp(ctk.CTk):
         
         # Accumulated Raw Data
         self.raw_t, self.raw_tot, self.raw_matrix = np.array([]), np.array([]), np.array([])
-        self.daq_t_s, self.px5Cum = np.array([]), np.array([])
+        self.px5_events = np.array([])
         self.has_h5 = False
         
         # Stitching Anchors
         self.parser_state = None  
         self.last_px5_time = 0.0
-        self.last_px5_cum = 0.0
 
         # Processed Data
         self.calib_mats = (a_m, b_m, c_m, t_m)
@@ -466,7 +504,6 @@ class AnalysisApp(ctk.CTk):
         self.plot_area = ctk.CTkFrame(self)
         self.plot_area.pack(side="right", fill="both", expand=True, padx=10, pady=10)
         
-        # --- NEW: Live File Status Label ---
         self.file_status_label = ctk.CTkLabel(self.sidebar, text="Initializing Reader...", font=("Arial", 14, "bold"), text_color="yellow")
         self.file_status_label.pack(pady=(5, 5))
         
@@ -581,12 +618,27 @@ class AnalysisApp(ctk.CTk):
         self.results_txt = ctk.CTkTextbox(self.sidebar, height=250, font=("Consolas", 14), state="disabled")
         self.results_txt.pack(fill="x", pady=10)
 
+        # Include Live Memory tracker only if psutil is successfully installed
+        if psutil is not None:
+            self.ram_label = ctk.CTkLabel(self.sidebar, text="RAM Usage: 0 MB", font=("Consolas", 12), text_color="cyan")
+            self.ram_label.pack(pady=5)
+            self._update_ram_monitor()
+
         self.fig = plt.figure(figsize=(12, 8))
         self.gs = gridspec.GridSpec(2, 2, height_ratios=[1.2, 1])
         self.ax1 = self.fig.add_subplot(self.gs[0, 0]); self.ax2 = self.fig.add_subplot(self.gs[0, 1]) 
         self.ax3 = self.fig.add_subplot(self.gs[1, 0]); self.ax4 = self.fig.add_subplot(self.gs[1, 1]) 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_area)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _update_ram_monitor(self):
+        if not self.winfo_exists() or psutil is None: return
+        
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        
+        self.ram_label.configure(text=f"App RAM Usage: {mem_mb:.1f} MB")
+        self.after(1000, self._update_ram_monitor)
 
     # ==============================================================================
     # LIVE ACCUMULATION (FILE LOADER QUEUE)
@@ -600,39 +652,32 @@ class AnalysisApp(ctk.CTk):
             t3p = self.t3p_files[self.file_idx]
             h5 = self.h5_files[self.file_idx] if self.file_idx < len(self.h5_files) else None
             
-            # Read files WITH STATE
-            new_t, new_tot, new_matrix, self.parser_state = load_advacam_t3p(
-                t3p, state=self.parser_state
-            )
-            new_daq_t, new_px5_c = load_daq_h5(h5) if h5 else (np.array([]), np.array([]))
+            new_t, new_tot, new_matrix, self.parser_state = load_advacam_t3p(t3p, state=self.parser_state)
+            new_px5_events, new_px5_duration = load_daq_h5(h5)
             
-            self.file_loader_queue.put((new_t, new_tot, new_matrix, new_daq_t, new_px5_c))
+            self.file_loader_queue.put((new_t, new_tot, new_matrix, new_px5_events, new_px5_duration))
             self.file_idx += 1
 
     def _check_file_loader(self):
+        if not self.winfo_exists(): return # Stop running if window is closed
         try:
-            new_t, new_tot, new_matrix, new_daq_t, new_px5_c = self.file_loader_queue.get_nowait()
+            new_t, new_tot, new_matrix, new_px5_events, new_px5_duration = self.file_loader_queue.get_nowait()
                 
-            if len(new_daq_t) > 0:
-                if len(self.daq_t_s) > 0:
-                    # Stitch the DAQ bins consecutively
-                    new_daq_t = new_daq_t[1:] + self.last_px5_time
-                    new_px5_c = new_px5_c[1:] + self.last_px5_cum
+            if new_px5_duration > 0:
+                if len(new_px5_events) > 0:
+                    new_px5_events += self.last_px5_time
+                    self.px5_events = np.concatenate((self.px5_events, new_px5_events)) if len(self.px5_events) > 0 else new_px5_events
                 
-                if len(new_daq_t) > 0:
-                    self.last_px5_time = new_daq_t[-1]
-                    self.last_px5_cum = new_px5_c[-1]
+                # Advance the global clock by the exact physical duration of the file
+                self.last_px5_time += new_px5_duration
+                self.has_h5 = True
 
             # Append Arrays
             self.raw_t = np.concatenate((self.raw_t, new_t)) if len(self.raw_t) > 0 else new_t
             self.raw_tot = np.concatenate((self.raw_tot, new_tot)) if len(self.raw_tot) > 0 else new_tot
             self.raw_matrix = np.concatenate((self.raw_matrix, new_matrix)) if len(self.raw_matrix) > 0 else new_matrix
             
-            self.daq_t_s = np.concatenate((self.daq_t_s, new_daq_t)) if len(self.daq_t_s) > 0 else new_daq_t
-            self.px5Cum = np.concatenate((self.px5Cum, new_px5_c)) if len(self.px5Cum) > 0 else new_px5_c
-            
-            self.has_h5 = len(self.daq_t_s) > 0
-            self.cached_engine = None # Invalidate cache so next update recalculates
+            self.cached_engine = None 
             
             status_text = f"Loaded {self.file_idx}/{len(self.t3p_files)} files."
             if self.file_idx < len(self.t3p_files):
@@ -641,7 +686,6 @@ class AnalysisApp(ctk.CTk):
             else:
                 self.file_status_label.configure(text=f"{status_text} (Complete)", text_color="green")
             
-            # Automatically plot the very first POPULATED file to get you started
             if not hasattr(self, 'first_plot_done') and len(self.raw_t) > 0:
                 self.first_plot_done = True
                 max_time = np.ceil(np.max(self.raw_t))
@@ -665,7 +709,7 @@ class AnalysisApp(ctk.CTk):
             return
 
         if self.t_s is None: self.update_plots()
-        if len(self.daq_t_s) < 2: return
+        if len(self.px5_events) < 2: return
         
         t_start = self.get_float(self.t_min)
         t_end = self.get_float(self.t_max)
@@ -698,8 +742,8 @@ class AnalysisApp(ctk.CTk):
         common_bin_edges = np.arange(t_start, t_end + bin_s, bin_s)
         adva_bins, _ = np.histogram(filtered_t_s, bins=common_bin_edges)
         
-        interp_px5 = np.interp(common_bin_edges, self.daq_t_s, self.px5Cum)
-        px5_bins_trunc = np.diff(interp_px5)
+        # Because we changed PX5 to event timestamps, we can just histogram it directly!
+        px5_bins_trunc, _ = np.histogram(self.px5_events, bins=common_bin_edges)
 
         adva_norm = adva_bins - np.mean(adva_bins)
         px5_norm = px5_bins_trunc - np.mean(px5_bins_trunc)
@@ -758,7 +802,6 @@ class AnalysisApp(ctk.CTk):
         self.cs_window.delete(0, "end"); self.cs_window.insert(0, str(window_ns))
         self.cs_max_span.delete(0, "end"); self.cs_max_span.insert(0, str(span_ns))
         
-        # Invalidate cache if accumulated raw data size has changed
         if "1." in selected_engine: state_key = f"{selected_engine}_{len(self.raw_t)}"
         else: state_key = f"{selected_engine}_{window_ns}_{span_ns}_{len(self.raw_t)}"
         
@@ -787,6 +830,7 @@ class AnalysisApp(ctk.CTk):
         self.calc_queue.put((state_key, res))
 
     def _check_calculation_queue(self):
+        if not self.winfo_exists(): return # Stop polling if window is closed
         try:
             state_key, res = self.calc_queue.get_nowait()
             self.x, self.y, self.energy, self.tot, self.t_s, self.cluster_sizes, self.bad_e_counts, self.span_rejected = res
@@ -866,11 +910,14 @@ class AnalysisApp(ctk.CTk):
         mode = self.mode_drop.get()
         if self.has_h5:
             offset_s = self.get_float(self.px5_offset)
-            interp_px5 = np.interp(common_bins + offset_s, self.daq_t_s, self.px5Cum)
-            c_px5 = np.interp(t_range[1] + offset_s, self.daq_t_s, self.px5Cum) - np.interp(t_range[0] + offset_s, self.daq_t_s, self.px5Cum)
+            shifted_px5 = self.px5_events - offset_s
             
             if self.show_px5_var.get() and mode == 'Bomb In':
-                self.ax2.plot(common_bins[:-1], np.diff(interp_px5), color='green', label='PX5', linewidth=1.5)
+                px5_counts_timeline, _ = np.histogram(shifted_px5, bins=common_bins)
+                self.ax2.plot(common_bins[:-1], px5_counts_timeline, color='green', label='PX5', linewidth=1.5)
+            
+            # Count total events inside the UI time window (Identical to px5Cum subtraction)
+            c_px5 = np.count_nonzero((shifted_px5 >= t_range[0]) & (shifted_px5 <= t_range[1]))
             
         self.ax2.set_title("Timeline", fontweight='bold')
         self.ax2.set_xlabel("Time (s)")
@@ -954,13 +1001,11 @@ if __name__ == "__main__":
 
     print("\n--- DATA SELECTION ---")
     
-    # 1. Select the Folder containing the run
     folder = filedialog.askdirectory(title="Select Folder containing .t3p and .h5 runs")
     if not folder:
         print("Operation cancelled. No folder selected.")
         sys.exit()
 
-    # 2. Automatically find, filter, and naturally sort the sequential files
     all_files = os.listdir(folder)
     t3p_files = sorted([os.path.join(folder, f) for f in all_files if f.endswith('.t3p')], key=natural_sort_key)
     h5_files = sorted([os.path.join(folder, f) for f in all_files if f.endswith('.h5')], key=natural_sort_key)
@@ -972,7 +1017,6 @@ if __name__ == "__main__":
     print(f"Found {len(t3p_files)} AdvaPIX (.t3p) files.")
     print(f"Found {len(h5_files)} PX5 (.h5) files.")
 
-    # --- NEW: File Range Selection Dialog ---
     if len(t3p_files) > 1:
         dialog = ctk.CTkInputDialog(
             text=f"Found {len(t3p_files)} .t3p files.\nEnter index range to analyze (e.g., 0-{len(t3p_files)-1})\nor leave blank to analyze all:", 
@@ -982,24 +1026,19 @@ if __name__ == "__main__":
         
         if range_input:
             try:
-                # Parse the input range (e.g., "0-1")
                 parts = range_input.replace(" ", "").split('-')
                 start_idx = int(parts[0])
                 end_idx = int(parts[1]) if len(parts) > 1 else start_idx
                 
-                # Safely constrain indices to valid bounds
                 start_idx = max(0, min(start_idx, len(t3p_files) - 1))
                 end_idx = max(start_idx, min(end_idx, len(t3p_files) - 1))
                 
-                # Slice the lists to keep only the requested range
                 t3p_files = t3p_files[start_idx:end_idx+1]
                 h5_files = h5_files[start_idx:end_idx+1] if h5_files else []
                 print(f"Applying filter: analyzing files {start_idx} through {end_idx}.")
             except Exception:
                 print("Invalid range format. Proceeding with all files.")
-    # ----------------------------------------
 
-    # 3. Select Calibration Matrix
     default_xml = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml"
     xml_file = filedialog.askopenfilename(
         title="Select Calibration .xml (Cancel to use default)",
@@ -1011,7 +1050,6 @@ if __name__ == "__main__":
 
     root.destroy() 
 
-    # 4. Pre-Load Calibration
     print("\n--- RUNNING CALIBRATION VALIDATION ---")
     a_m, b_m, c_m, t_m = load_calibration_matrices(xml_file)
     lengths = [len(a_m), len(b_m), len(c_m), len(t_m)]
@@ -1020,6 +1058,5 @@ if __name__ == "__main__":
         raise ValueError(f"CRITICAL ERROR: Calibration arrays have mismatched lengths: {lengths}")
     print("Calibration Coverage: PASSED\n----------------------------------\n")
 
-    # 5. Launch the App (It will start reading the files in the background)
     app = AnalysisApp(t3p_files, h5_files, a_m, b_m, c_m, t_m)
     app.mainloop()
