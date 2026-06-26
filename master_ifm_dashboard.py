@@ -267,6 +267,17 @@ def load_calibration_matrices(xml_filepath):
     for param in ['caliba', 'calibb', 'calibc', 'calibt']:
         tags = root.findall(f'.//{param}')
         data_list = [np.frombuffer(base64.b64decode(tag.text.strip()), dtype=np.float64) for tag in tags]
+        
+        # --- CHIP 1 ROTATION FIX ---
+        # Jan confirmed: the XML stores calibration matrices in VISUAL order (Top-Left origin).
+        # Chip 0's electrical origin is Top-Left, so it maps directly.
+        # Chip 1's electrical origin is Bottom-Right (rotated 180 degrees). 
+        # Reversing the 1D array perfectly rotates the matrix 180 degrees, 
+        # aligning it with the raw electrical matrixIdx from the .t3p file.
+        if len(data_list) > 1:
+            data_list[1] = data_list[1][::-1]
+        # ---------------------------
+            
         matrices[param] = np.concatenate(data_list)
     return matrices['caliba'], matrices['calibb'], matrices['calibc'], matrices['calibt']
 
