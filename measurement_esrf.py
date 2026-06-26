@@ -5,6 +5,8 @@ import numpy as np
 import time
 import h5py
 import threading
+import os
+from tkinter import filedialog
 
 # Set the theme
 ctk.set_appearance_mode("Dark")
@@ -15,7 +17,7 @@ class DAQControlApp(ctk.CTk):
         super().__init__()
         
         self.title("ESRF MI-1545: Detector Sync Control")
-        self.geometry("900x850")
+        self.geometry("900x900") # Slightly taller to accommodate the new row
         
         # --- Data Mapping ---
         self.bin_options = {
@@ -26,6 +28,8 @@ class DAQControlApp(ctk.CTk):
             '10 ms (100 Hz)': 1e2, 
             '100 ms (10 Hz)': 10.0
         }
+        
+        self.save_dir = os.getcwd() # Default to current working directory
         
         self.build_ui()
         self.update_hardware_calc() # Run initial calculation
@@ -38,6 +42,17 @@ class DAQControlApp(ctk.CTk):
         
         ctk.CTkLabel(setup_frame, text="Measurement Setup", font=("Arial", 20, "bold")).pack(pady=10)
         
+        # Save Directory (NEW)
+        dir_frame = ctk.CTkFrame(setup_frame, fg_color="transparent")
+        dir_frame.pack(pady=5, fill="x", padx=20)
+        ctk.CTkLabel(dir_frame, text="Save Folder:").pack(side="left", padx=10)
+        self.ui_save_dir = ctk.CTkEntry(dir_frame, width=400)
+        self.ui_save_dir.insert(0, self.save_dir)
+        self.ui_save_dir.pack(side="left")
+        
+        self.btn_browse = ctk.CTkButton(dir_frame, text="Browse...", width=80, command=self.browse_folder)
+        self.btn_browse.pack(side="left", padx=10)
+
         # File Name
         file_frame = ctk.CTkFrame(setup_frame, fg_color="transparent")
         file_frame.pack(pady=5, fill="x", padx=20)
@@ -117,6 +132,13 @@ class DAQControlApp(ctk.CTk):
         self.console_out = ctk.CTkTextbox(self, height=200, state="disabled", font=("Consolas", 12))
         self.console_out.pack(pady=10, padx=20, fill="both", expand=True)
 
+    def browse_folder(self):
+        folder_selected = filedialog.askdirectory(initialdir=self.save_dir, title="Select Output Folder")
+        if folder_selected:
+            self.save_dir = folder_selected
+            self.ui_save_dir.delete(0, "end")
+            self.ui_save_dir.insert(0, self.save_dir)
+
     def slider_event(self, value):
         self.ui_chunk_val.configure(text=str(int(value)))
         self.update_hardware_calc()
@@ -175,6 +197,17 @@ class DAQControlApp(ctk.CTk):
         chunk_s = float(int(self.ui_chunk.get()))
         binRateHz = float(self.bin_options[self.ui_bin_size.get()])
         
+        # Check and prepare save directory
+        current_save_dir = self.ui_save_dir.get().strip()
+        if not os.path.exists(current_save_dir):
+            try:
+                os.makedirs(current_save_dir)
+                self.log_msg(f"Created new directory: {current_save_dir}")
+            except Exception as e:
+                self.log_msg(f"Error creating directory {current_save_dir}: {e}")
+                self.log_msg(f"Defaulting to current working directory: {os.getcwd()}")
+                current_save_dir = os.getcwd()
+
         if total_duration_s <= 0:
             self.log_msg("Error: Total duration must be greater than 0.")
             self.ui_status.configure(text="Live Status: Error - Invalid Duration", text_color="red")
@@ -193,6 +226,7 @@ class DAQControlApp(ctk.CTk):
         num_splits = int(np.ceil(total_duration_s / split_s))
         
         self.log_msg(f"--- EXPERIMENT SETTINGS ---")
+        self.log_msg(f"Save Folder    : {current_save_dir}")
         self.log_msg(f"File Prefix    : {self.ui_filename.get()}")
         self.log_msg(f"Total Duration : {total_duration_s} seconds")
         self.log_msg(f"File Splitting : Every {split_s} seconds")
@@ -240,13 +274,16 @@ class DAQControlApp(ctk.CTk):
                 for split_idx in range(num_splits):
                     if self.stop_flag: break 
                     
-                    hdf5_filename = f"{self.ui_filename.get()}_{split_idx:03d}.h5"
+                    # Generate the full absolute path
+                    base_filename = f"{self.ui_filename.get()}_{split_idx:03d}.h5"
+                    hdf5_filepath = os.path.join(current_save_dir, base_filename)
+                    
                     remaining_s = total_duration_s - (split_idx * split_s)
                     current_split_s = min(split_s, remaining_s)
                     current_split_chunks = int(np.ceil(current_split_s / chunk_s))
                     
-                    with h5py.File(hdf5_filename, "w") as f:
-                        self.log_msg(f"[→] Opened new file: {hdf5_filename}")
+                    with h5py.File(hdf5_filepath, "w") as f:
+                        self.log_msg(f"[→] Opened new file: {hdf5_filepath}")
                         dset_px5 = f.create_dataset("px5CountsPerBin", shape=(0,), maxshape=(None,), dtype='uint8', chunks=(chunk_bins,), compression="gzip")
                         f.attrs['bin_s'], f.attrs['split_duration_s'] = bin_s, current_split_s
                         
