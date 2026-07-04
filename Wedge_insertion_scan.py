@@ -8,6 +8,7 @@ from matplotlib.widgets import RectangleSelector
 import customtkinter as ctk
 from pylablib.devices import Thorlabs
 
+
 # ==========================================
 # 1. GLOBAL HARDWARE SETUP & CONSTANTS
 # ==========================================
@@ -15,11 +16,26 @@ PIXETDIR = r"C:\Program Files\PIXet Pro"
 SAVE_DIR = r"C:\Eldar\Eldar_IFM\esrf_ifm_data\Automatic_wedge_insertion"
 SERIAL_NUM = "83860502"
 
-# Ensure the scan directory exists immediately to suppress native Windows dialogs
+# ADD THIS LINE: Point to your actual XML file
+CALIBRATION_XML = r"C:\Eldar\Eldar_IFM\esrf_ifm_data\my_quad_camera_config.xml"# Ensure the scan directory exists immediately to suppress native Windows dialogs
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # Add PIXet API folder to system environment path
 sys.path.append(PIXETDIR)
+
+# CRITICAL WORKING DIRECTORY FOR HWLIBS:
+# We MUST change the working directory to the PIXet folder so pypixet can locate its drivers
+original_cwd = os.getcwd()
+os.chdir(PIXETDIR)
+
+# CRITICAL SECURITY PATCH FOR PYTHON 3.8+:
+# Authorize Python to look inside the PIXet folder to link compiled C++ hardware DLLs
+if hasattr(os, 'add_dll_directory'):
+    try:
+        os.add_dll_directory(PIXETDIR)
+    except Exception as e:
+        print(f"DLL Directory Initialization Warning: {e}")
+
 try:
     import pypixet
 except ImportError:
@@ -33,39 +49,39 @@ except ImportError:
 def load_and_calibrate_frame(filepath):
     """
     Loads a PIXet ASCII text frame matrix and applies CdTe orientation correction.
+    Handles the 256x512 multi-chip widescreen array geometry.
     """
-    # Simply load the 256x256 grid of text numbers directly into a 2D NumPy array
+    # Load the widescreen grid of numbers directly into a 2D NumPy array (256, 512)
     raw_matrix = np.loadtxt(filepath)
 
     # CRITICAL CADMIUM TELLURIDE (CdTe) CALIBRATION:
-    # Rotate the matrix 90 degrees counter-clockwise because the first pixel indexing
-    # begins at the physical bottom-left corner relative to the readout wires.
+    # Rotate 90 degrees counter-clockwise. Shape changes from (256, 512) to (512, 256).
     calibrated_matrix = np.rot90(raw_matrix, k=1)
 
     return calibrated_matrix
 
 
 def visually_select_roi(frame_matrix):
-    """Opens an interactive matplotlib selector to slice out the region of interest."""
-    fig, ax = plt.subplots(figsize=(6, 6))
+    """Opens an interactive matplotlib selector adjusted for the 512x256 multi-chip orientation."""
+    fig, ax = plt.subplots(figsize=(5, 8))  # Vertical aspect ratio matching the rotated sensor layout
     ax.imshow(frame_matrix, cmap='viridis', origin='lower')
-    plt.title("Click & Drag to define ROI rectangle.\nClose this window to lock coordinates.")
+    plt.title("Click & Drag to define ROI rectangle.\\nClose this window to lock coordinates.")
 
-    # Default fall-back bounds equal to the whole chip matrix
+    # Default fall-back bounds equal to the whole multi-chip sensor area
     roi_coords = [0, frame_matrix.shape[0], 0, frame_matrix.shape[1]]
 
     def onselect(eclick, erelease):
         x1, y1 = int(eclick.xdata), int(eclick.ydata)
         x2, y2 = int(erelease.xdata), int(erelease.ydata)
 
-        # Enforce strict matrix slicing constraints [ymin:ymax, xmin:xmax]
+        # Enforce matrix slicing constraints within the rotated geometry bounds
         roi_coords[0] = max(0, min(y1, y2))
         roi_coords[1] = min(frame_matrix.shape[0], max(y1, y2))
         roi_coords[2] = max(0, min(x1, x2))
         roi_coords[3] = min(frame_matrix.shape[1], max(x1, x2))
 
     rs = RectangleSelector(ax, onselect, useblit=True, button=[1], interactive=True)
-    plt.show(block=True)  # Block execution until the user closes the window
+    plt.show(block=True)  # Block execution until the window is closed
     return roi_coords
 
 
@@ -80,7 +96,7 @@ class MasterControlDashboard(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("ESRF Automated Hardware Scan - MTS50-Z8 & AdvaPIX")
+        self.title("ESRF Automated Hardware Scan - MTS50-Z8 & AdvaPIX Quad")
         self.geometry("980x680")
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -110,7 +126,7 @@ class MasterControlDashboard(ctk.CTk):
         self.main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
         self.main_frame.grid_columnconfigure((0, 1), weight=1)
 
-        ctk.CTkLabel(self.main_frame, text="Real-Time Data Acquisition (Frames Mode)",
+        ctk.CTkLabel(self.main_frame, text="Real-Time Data Acquisition (Quad 256x512 Mode)",
                      font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, columnspan=2, padx=10,
                                                                     pady=(0, 20), sticky="w")
 
@@ -124,7 +140,7 @@ class MasterControlDashboard(ctk.CTk):
         self.card_cnt = ctk.CTkFrame(self.main_frame)
         self.card_cnt.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
         ctk.CTkLabel(self.card_cnt, text="ROI Integral Counts", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
-        self.lbl_counts = ctk.CTkLabel(self.card_cnt, text="--", font=ctk.CTkFont(size=32, text_color="#2FA572"))
+        self.lbl_counts = ctk.CTkLabel(self.card_cnt, text="--", font=ctk.CTkFont(size=32), text_color="#2FA572")
         self.lbl_counts.pack(pady=(0, 15))
 
         # Config Parameter Entry Grids
@@ -175,7 +191,7 @@ class MasterControlDashboard(ctk.CTk):
 
     def log(self, message):
         """Thread-safe standard console stream output update."""
-        self.log_box.insert(ctk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        self.log_box.insert(ctk.END, f"[{time.strftime('%H:%M:%S')}] {message}\\n")
         self.log_box.see(ctk.END)
 
     def connect_hardware_drivers(self):
@@ -184,17 +200,21 @@ class MasterControlDashboard(ctk.CTk):
             # Initialize ADVACAM Core
             pypixet.start()
             self.pixet_core = pypixet.pixet
-            devices = self.pixet_core.devicesByType(self.pixet_core.PX_DEVTYPE_TPX3)
-            if not devices:
-                self.log("CORE ERROR: AdvaPIX detector stack undetected via USB.")
+
+            # Universal device discovery array lookup
+            all_devices = self.pixet_core.devices()
+            physical_devices = [dev for dev in all_devices if dev.fullName() != "FileDevice 0"]
+
+            if not physical_devices:
+                self.log("CORE ERROR: AdvaPIX Quad assembly undetected over USB.")
             else:
-                self.camera = devices[0]
-                self.log(f"Detector Synchronized: {self.camera.name()}")
+                self.camera = physical_devices[0]
+                self.log(f"Detector Synchronized: {self.camera.fullName()}")
 
             # Initialize Thorlabs Cube Controller
             self.motor = Thorlabs.KinesisMotor(SERIAL_NUM)
             self.log(f"Controller Bound (SN: {SERIAL_NUM}). Commencing axis homing...")
-            # self.motor.home()  # Uncomment this during live integration
+            self.motor.home()  # Absolute coordinate tracking homing baseline step
             self.log("Hardware deployment sequence standing by.")
         except Exception as e:
             self.log(f"Driver connection faulted or missing hardware: {e}")
@@ -204,10 +224,6 @@ class MasterControlDashboard(ctk.CTk):
         self.stop_requested = True
 
     def arm_scout_sequence(self):
-        if self.camera is None or self.motor is None:
-            self.log("FAIL: Hardware endpoints uninitialized. Cannot command execution.")
-            return
-
         try:
             start_pos = float(self.entry_start.get())
             end_pos = float(self.entry_end.get())
@@ -223,17 +239,23 @@ class MasterControlDashboard(ctk.CTk):
         self.log("Executing single scout reference frame to evaluate beam position...")
         test_file = os.path.join(SAVE_DIR, "scout_reference_frame.txt")
 
-        # Pulls dynamic parameters directly from UI input and forces ASCII format output
-        self.camera.doSimpleAcquisition(1, exp_time, self.pixet_core.PX_FTYPE = "TXT", test_file)
+        # --- HARDWARE CHECK & MOCKING ---
+        if self.camera is not None and self.pixet_core is not None:
+            self.camera.doSimpleAcquisition(1, exp_time, self.pixet_core.PX_FTYPE_AUTODETECT, test_file)
+            test_matrix = load_and_calibrate_frame(test_file)
+        else:
+            # Simulation Mode: Generates a mock widescreen array structure (256 rows, 512 columns)
+            self.log("[SIMULATION MODE] Generating widescreen (256x512) mock scout array...")
+            time.sleep(exp_time)
+            raw_mock = np.random.randint(0, 100, size=(256, 512))
+            test_matrix = np.rot90(raw_mock, k=1)  # Rotated internally to match the live data framework
 
-        test_matrix = load_and_calibrate_frame(test_file)
-
-        # Render visual selection map (Blocks current thread till window closes)
+        # Render widescreen aspect visual selection window mapping
         self.roi_coords = visually_select_roi(test_matrix)
         self.log(
             f"ROI Boundary Matrices Set -> Y[{self.roi_coords[0]}:{self.roi_coords[1]}], X[{self.roi_coords[2]}:{self.roi_coords[3]}]")
 
-        # Hand off control to background thread to shield Main Loop UI response
+        # Deploy non-blocking execution thread tracking
         self.scan_thread = threading.Thread(target=self.execute_background_loop,
                                             args=(start_pos, end_pos, step_size, exp_time))
         self.scan_thread.start()
@@ -254,24 +276,31 @@ class MasterControlDashboard(ctk.CTk):
 
             target_pos = start_pos + (step * step_size)
 
-            # Step Axis Engine
-            self.motor.move_to(target_pos)
-            self.motor.wait_move()
+            # --- HARDWARE CHECK & MOCKING ---
+            if self.motor is not None and self.camera is not None:
+                # Real Hardware Execution
+                self.motor.move_to(target_pos)
+                self.motor.wait_move()
 
-            # Direct Storage File Sinking (TXT matrix output format)
-            filename = os.path.join(SAVE_DIR, f"scan_pos_{target_pos:.2f}.txt")
-            self.camera.doSimpleAcquisition(1, exp_time, self.pixet_core.PX_FTYPE = "TXT", filename)
+                filename = os.path.join(SAVE_DIR, f"scan_pos_{target_pos:.2f}.txt")
+                self.camera.doSimpleAcquisition(1, exp_time, self.pixet_core.PX_FTYPE_AUTODETECT, filename)
+                frame_matrix = load_and_calibrate_frame(filename)
+            else:
+                # Simulation Mode Execution (256x512 widescreen modeling array topology)
+                time.sleep(0.5)
+                time.sleep(exp_time)
+                raw_mock = np.random.randint(0, 100, size=(256, 512))
+                frame_matrix = np.rot90(raw_mock, k=1)
 
-            # Load ASCII data trivially via Numpy text parsing
-            frame_matrix = load_and_calibrate_frame(filename)
+            # Slice the matrix using your precise ROI coordinates mapping parameters
             roi_slice = frame_matrix[y1:y2, x1:x2]
             summed_integral = np.sum(roi_slice)
 
-            # Commit tracking variables
+            # Record spatial data curves tracking parameters
             positions_profile.append(target_pos)
             counts_profile.append(summed_integral)
 
-            # Direct Thread-Safe UI Component Redraw
+            # Live dashboard text/progressbar component interface updater calls
             current_progress = (step + 1) / num_steps
             self.progressbar.set(current_progress)
             self.lbl_position.configure(text=f"{target_pos:.2f}")
@@ -281,11 +310,11 @@ class MasterControlDashboard(ctk.CTk):
 
         self.log("Pipeline routine complete. Parking motor. Closing links.")
 
-        # Normalize UI State Elements
+        # Normalize interactive widget buttons states safely
         self.start_btn.configure(state="normal")
         self.progressbar.set(1.0)
 
-        # Safely delay and signal generation plotting mapping to avoid frame rendering violations
+        # Matplotlib profile layout generator frame trigger delays
         self.after(400, lambda: self.render_profile_plot(positions_profile, counts_profile))
 
     def render_profile_plot(self, positions, counts):
@@ -303,6 +332,7 @@ class MasterControlDashboard(ctk.CTk):
     def handle_shutdown_cleanup(self):
         """Graceful hardware detachment handler."""
         try:
+            os.chdir(original_cwd)  # Restore baseline directory before closure state termination
             if self.motor:
                 self.motor.close()
             pypixet.exit()
