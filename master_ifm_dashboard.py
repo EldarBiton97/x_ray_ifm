@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import Rectangle
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import customtkinter as ctk
 from customtkinter import filedialog
 import h5py
@@ -274,8 +274,8 @@ def load_calibration_matrices(xml_filepath):
         # Chip 1's electrical origin is Bottom-Right (rotated 180 degrees). 
         # Reversing the 1D array perfectly rotates the matrix 180 degrees, 
         # aligning it with the raw electrical matrixIdx from the .t3p file.
-        if len(data_list) > 1:
-            data_list[1] = data_list[1][::-1]
+        #if len(data_list) > 1:
+         #   data_list[1] = data_list[1][::-1]
         # ---------------------------
             
         matrices[param] = np.concatenate(data_list)
@@ -638,9 +638,19 @@ class AnalysisApp(ctk.CTk):
         self.fig = plt.figure(figsize=(12, 8))
         self.gs = gridspec.GridSpec(2, 2, height_ratios=[1.2, 1])
         self.ax1 = self.fig.add_subplot(self.gs[0, 0]); self.ax2 = self.fig.add_subplot(self.gs[0, 1]) 
-        self.ax3 = self.fig.add_subplot(self.gs[1, 0]); self.ax4 = self.fig.add_subplot(self.gs[1, 1]) 
+        self.ax3 = self.fig.add_subplot(self.gs[1, 0]); self.ax4 = self.fig.add_subplot(self.gs[1, 1])
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_area)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Create a frame specifically for the toolbar to sit below the plot
+        self.toolbar_frame = ctk.CTkFrame(self.plot_area, height=40, fg_color="transparent")
+        self.toolbar_frame.pack(side="bottom", fill="x", padx=10, pady=5)
+
+        # Initialize and pack the Navigation Toolbar
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
+        self.toolbar.update()
+
+        # Pack the canvas above the toolbar
+        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
     def _update_ram_monitor(self):
         if not self.winfo_exists() or psutil is None: return
@@ -866,17 +876,30 @@ class AnalysisApp(ctk.CTk):
 
         x_f, y_f, t_f = self.x[counting_mask], self.y[counting_mask], self.t_s[counting_mask]
         tot_f = self.tot[counting_mask]
-        
+
         n_before = len(self.energy)
         n_after = np.count_nonzero(counting_mask)
-        
-        self.ax1.clear(); self.ax2.clear(); self.ax3.clear(); self.ax4.clear()
-        
+
+        # 1. Capture the current zoom limits before clearing
+        current_xlim = self.ax1.get_xlim()
+        current_ylim = self.ax1.get_ylim()
+
+        self.ax1.clear();
+        self.ax2.clear();
+        self.ax3.clear();
+        self.ax4.clear()
+
         img, _, _ = np.histogram2d(x_f, y_f, bins=[self.max_x, self.max_y], range=[[0, self.max_x], [0, self.max_y]])
         self.ax1.imshow(np.log10(img.T + 1), origin='lower', cmap='viridis', extent=[0, self.max_x, 0, self.max_y])
         self.ax1.set_title(f"X-Ray Hit Map ({e_min}-{e_max} keV)", fontweight='bold')
         self.ax1.set_xlabel("X (Pixels)")
         self.ax1.set_ylabel("Y (Pixels)")
+
+        # 2. Reapply the zoom limits (ignoring the default empty plot limits of 0.0 to 1.0)
+        if current_xlim != (0.0, 1.0) and current_ylim != (0.0, 1.0):
+            self.ax1.set_xlim(current_xlim)
+            self.ax1.set_ylim(current_ylim)
+
         
         bin_s = self.get_float(self.bin_ms) / 1000.0
         t_range = [self.get_float(self.t_min), self.get_float(self.t_max)]
@@ -1050,7 +1073,7 @@ if __name__ == "__main__":
             except Exception:
                 print("Invalid range format. Proceeding with all files.")
 
-    default_xml = r"G:\האחסון שלי\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml"
+    default_xml = r"G:\My Drive\ESRF IFM\AdvaPIX-D04-W0126-2 (1).xml"
     xml_file = filedialog.askopenfilename(
         title="Select Calibration .xml (Cancel to use default)",
         filetypes=[("XML Files", "*.xml"), ("All Files", "*.*")]
